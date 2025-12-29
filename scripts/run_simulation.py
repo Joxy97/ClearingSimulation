@@ -23,9 +23,9 @@ from clearing.trading import TradeParams  # noqa: E402
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run clearing simulation with RBM scenarios.")
-    parser.add_argument("--M", type=int, default=10, help="Number of clients.")
-    parser.add_argument("--N", type=int, default=500, help="Number of instruments.")
+    parser.add_argument("--M", type=int, default=1000, help="Number of clients.")
     parser.add_argument("--T", type=int, default=10, help="Number of simulation days.")
+    parser.add_argument("--N", type=int, default=500, help="Number of instruments. Change requires new RBM.")
     parser.add_argument("--Omega", type=int, default=1000, help="Scenarios per day.")
     parser.add_argument("--model-run", type=str, default="models/model", help="RBM run folder.")
     parser.add_argument("--quantizer", type=str, default="data/quantizer.pt", help="Quantizer path (optional).")

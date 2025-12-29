@@ -4,5 +4,6 @@ pandas
 matplotlib
 dimod
 dwave-neal
+dwave-ocean-sdk
 streamlit
 git+https://github.com/Joxy97/BoltzmaNN9.git
