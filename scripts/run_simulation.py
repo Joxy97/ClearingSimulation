@@ -24,10 +24,10 @@ from clearing.trading import TradeParams  # noqa: E402
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run clearing simulation with RBM scenarios.")
     parser.add_argument("--M", type=int, default=10, help="Number of clients.")
-    parser.add_argument("--N", type=int, default=5, help="Number of instruments.")
+    parser.add_argument("--N", type=int, default=500, help="Number of instruments.")
     parser.add_argument("--T", type=int, default=10, help="Number of simulation days.")
-    parser.add_argument("--Omega", type=int, default=500, help="Scenarios per day.")
-    parser.add_argument("--model-run", type=str, default="models/model_mini", help="RBM run folder.")
+    parser.add_argument("--Omega", type=int, default=1000, help="Scenarios per day.")
+    parser.add_argument("--model-run", type=str, default="models/model", help="RBM run folder.")
     parser.add_argument("--quantizer", type=str, default="data/quantizer.pt", help="Quantizer path (optional).")
     parser.add_argument("--quantizer-fit-T", type=int, default=10000, help="Days for fitting quantizer if not found.")
     parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, or cuda.")
@@ -44,6 +44,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-base-scale", type=float, default=5.0, help="Base trade size.")
     parser.add_argument("--trade-noise-scale", type=float, default=0.3, help="Trade noise scale.")
     parser.add_argument("--trade-max-abs", type=float, default=100.0, help="Max absolute trade size.")
+    parser.add_argument("--init-collateral-buffer", type=float, default=0.10, help="Initial collateral buffer as fraction of ES.")
+    parser.add_argument("--init-liquidity-buffer", type=float, default=0.20, help="Initial liquidity buffer as fraction of ES.")
     parser.add_argument("--log-path", type=str, default="simulations/logs/run_log.pt", help="Output path for log tensor.")
     return parser.parse_args()
 
@@ -104,8 +106,9 @@ def main() -> None:
     mask = (torch.rand((args.M, args.N), device=device, generator=g_init) < 0.30).to(dtype=dtype)
     P = P_raw * mask
 
-    W = torch.normal(mean=20000.0, std=5000.0, size=(args.M,), device=device, dtype=dtype, generator=g_init)
     C = torch.zeros((args.M,), device=device, dtype=dtype)
+    W = torch.zeros((args.M,), device=device, dtype=dtype)
+    default_loss = torch.zeros((args.M,), device=device, dtype=dtype)
     alive = torch.ones((args.M,), device=device, dtype=torch.bool)
 
     z_prev = 0
@@ -143,7 +146,10 @@ def main() -> None:
         device=device,
     )
     M_req_init = margin_es(P, R_init, alpha=sim_params.alpha)
-    C = M_req_init * 1.10
+    M_req_init = torch.clamp(M_req_init, min=0.0)
+    C = M_req_init * (1.0 + float(args.init_collateral_buffer))
+    F_init = M_req_init * float(args.init_liquidity_buffer)
+    W = C + F_init
 
     logger = SimLogger(
         LogConfig(
@@ -159,6 +165,7 @@ def main() -> None:
             P=P,
             W=W,
             C=C,
+            default_loss=default_loss,
             alive=alive,
             z_prev=z_prev,
             r_prev=r_prev,
@@ -181,6 +188,7 @@ def main() -> None:
         )
 
         P, W, C, alive = out["P"], out["W"], out["C"], out["alive"]
+        default_loss = out.get("default_loss", default_loss)
         z_prev, r_prev = out["z_prev"], out["r_prev"]
 
         default_now = out["default_now"]
@@ -206,7 +214,38 @@ def main() -> None:
         out_dir = os.path.dirname(args.log_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-        torch.save(logger.get(), args.log_path)
+        metadata = {
+            "M": int(args.M),
+            "N": int(args.N),
+            "T": int(args.T),
+            "Omega": int(args.Omega),
+            "model_run": str(args.model_run),
+            "quantizer": str(args.quantizer),
+            "quantizer_fit_T": int(args.quantizer_fit_T),
+            "device": str(device),
+            "dtype": str(args.dtype),
+            "seed_market": int(args.seed_market),
+            "seed_trade": int(args.seed_trade),
+            "burn_in": int(args.burn_in),
+            "thin": int(args.thin),
+            "qubo_solver": str(args.qubo_solver),
+            "budget_B": float(args.budget),
+            "lambda_budget": float(args.lambda_budget),
+            "eta_risk": float(args.eta_risk),
+            "utility_weight": float(args.utility_weight),
+            "trade_base_scale": float(args.trade_base_scale),
+            "trade_noise_scale": float(args.trade_noise_scale),
+            "trade_max_abs": float(args.trade_max_abs),
+            "init_collateral_buffer": float(args.init_collateral_buffer),
+            "init_liquidity_buffer": float(args.init_liquidity_buffer),
+            "trade_momentum_weight": float(trade_params.momentum_weight),
+            "trade_gamma_exposure": float(trade_params.gamma_exposure),
+            "p_trade_when_zero": float(trade_params.p_trade_when_zero),
+            "zero_trade_std": float(trade_params.zero_trade_std),
+            "alpha": float(sim_params.alpha),
+            "post_full_margin_daily": bool(sim_params.post_full_margin_daily),
+        }
+        torch.save({"records": logger.get(), "meta": metadata}, args.log_path)
         print(f"Saved log to {args.log_path}")
 
 

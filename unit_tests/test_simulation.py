@@ -21,6 +21,7 @@ class TestSimulation(unittest.TestCase):
         P = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=dtype)
         W = torch.tensor([10.0, 0.5], dtype=dtype)
         C = torch.zeros((M,), dtype=dtype)
+        default_loss = torch.zeros((M,), dtype=dtype)
         alive = torch.ones((M,), dtype=torch.bool)
 
         z_prev = 0
@@ -67,6 +68,7 @@ class TestSimulation(unittest.TestCase):
                 P=P,
                 W=W,
                 C=C,
+                default_loss=default_loss,
                 alive=alive,
                 z_prev=z_prev,
                 r_prev=r_prev,

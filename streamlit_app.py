@@ -29,11 +29,14 @@ def _color_from_value(val: float, max_abs: float, pos_rgb: tuple[int, int, int],
     base = pos_rgb if val > 0 else neg_rgb
     return _blend_color(base, intensity)
 
-PHASE_ORDER = ["start", "market", "margin", "trades", "decision", "end"]
+PHASE_ORDER = ["start", "market_move", "settlement", "market", "margin", "default", "trades", "decision", "end"]
 PHASE_LABELS = {
     "start": "Start of the Day",
-    "market": "Market Update",
+    "market_move": "Market Move",
+    "settlement": "Settlement",
+    "market": "Market Move",
     "margin": "Margins",
+    "default": "Default",
     "trades": "Suggested Trades",
     "decision": "QUBO Clearing",
     "end": "End of the Day",
@@ -73,7 +76,7 @@ def _build_records_by_day(records: List[Dict[str, Any]]) -> Dict[int, Dict[str, 
 def _market_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for rec in records:
-        if rec.get("phase") != "market":
+        if rec.get("phase") not in {"market_move", "market"}:
             continue
         day = int(rec.get("day", -1))
         z_t = rec.get("z_t")
@@ -92,7 +95,7 @@ def _market_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
 def _pnl_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for rec in records:
-        if rec.get("phase") != "market":
+        if rec.get("phase") not in {"market_move", "market"}:
             continue
         day = int(rec.get("day", -1))
         pnl = _to_numpy(rec.get("pnl"))
@@ -101,6 +104,44 @@ def _pnl_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
         row = {"day": day}
         for i in range(pnl.shape[0]):
             row[f"cl_{i + 1}"] = float(pnl[i])
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("day")
+
+
+def _wealth_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    phase_priority = [
+        "settlement",
+        "default",
+        "trades",
+        "decision",
+        "end",
+        "market_move",
+        "market",
+        "start",
+    ]
+    phase_rank = {p: i for i, p in enumerate(phase_priority)}
+    by_day: Dict[int, Dict[str, Any]] = {}
+    for rec in records:
+        day = int(rec.get("day", -1))
+        phase = rec.get("phase")
+        if phase not in phase_rank:
+            continue
+        if rec.get("W") is None:
+            continue
+        prev = by_day.get(day)
+        if prev is None or phase_rank[phase] < phase_rank[prev.get("phase")]:
+            by_day[day] = rec
+
+    rows = []
+    for day, rec in by_day.items():
+        W = _to_numpy(rec.get("W"))
+        if W is None:
+            continue
+        row = {"day": day}
+        for i in range(W.shape[0]):
+            row[f"cl_{i + 1}"] = float(W[i])
         rows.append(row)
     if not rows:
         return pd.DataFrame()
@@ -217,8 +258,10 @@ def _stats_table_html(
         rule = color_rules.get(col) if color_rules else None
         if not rule:
             return None
+        values = rule.get("values")
+        value = float(values[i]) if values is not None else float(data[i, j])
         return _color_from_value(
-            float(data[i, j]),
+            value,
             float(rule["max_abs"]),
             rule["pos_rgb"],
             rule["neg_rgb"],
@@ -356,7 +399,14 @@ def main() -> None:
         st.warning("run_log.pt not found. Provide a valid path in the sidebar.")
         st.stop()
 
-    records = _torch_load(path)
+    data = _torch_load(path)
+    meta = None
+    if isinstance(data, dict) and "records" in data:
+        records = data.get("records")
+        meta = data.get("meta")
+    else:
+        records = data
+
     if not isinstance(records, list):
         st.error("run_log.pt should contain a list of records.")
         st.stop()
@@ -371,6 +421,50 @@ def main() -> None:
     max_clients = int(st.sidebar.number_input("Max clients", min_value=1, value=12, step=1))
     max_assets = int(st.sidebar.number_input("Max instruments", min_value=1, value=12, step=1))
     max_scenarios = int(st.sidebar.number_input("Max scenarios", min_value=1, value=8, step=1))
+    with st.sidebar.expander("Simulation metadata", expanded=False):
+        if isinstance(meta, dict) and meta:
+            meta_order = [
+                ("M", "Number of clients"),
+                ("N", "Number of instruments"),
+                ("T", "Number of simulation days"),
+                ("Omega", "Scenarios per day"),
+                ("model_run", "RBM run folder"),
+                ("quantizer", "Quantizer path"),
+                ("quantizer_fit_T", "Days for fitting quantizer"),
+                ("device", "Device"),
+                ("dtype", "Tensor dtype"),
+                ("seed_market", "Market RNG seed"),
+                ("seed_trade", "Trade RNG seed"),
+                ("burn_in", "RBM burn-in"),
+                ("thin", "RBM thinning"),
+                ("qubo_solver", "QUBO solver"),
+                ("budget_B", "Risk budget B"),
+                ("lambda_budget", "Budget penalty lambda"),
+                ("eta_risk", "Risk penalty eta"),
+                ("utility_weight", "Utility weight"),
+                ("trade_base_scale", "Base trade size"),
+                ("trade_noise_scale", "Trade noise scale"),
+                ("trade_max_abs", "Max absolute trade size"),
+                ("init_collateral_buffer", "Init collateral buffer"),
+                ("init_liquidity_buffer", "Init liquidity buffer"),
+                ("trade_momentum_weight", "Momentum weight"),
+                ("trade_gamma_exposure", "Exposure gamma"),
+                ("p_trade_when_zero", "Trade prob when zero"),
+                ("zero_trade_std", "Zero trade std"),
+                ("alpha", "Alpha (ES)"),
+                ("post_full_margin_daily", "Post full margin daily"),
+            ]
+            rows = []
+            seen = set()
+            for key, label in meta_order:
+                if key in meta:
+                    rows.append({"Parameter": label, "Value": meta.get(key)})
+                    seen.add(key)
+            for key in sorted(k for k in meta.keys() if k not in seen):
+                rows.append({"Parameter": key, "Value": meta.get(key)})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No metadata found in log. Re-run the simulation to include it.")
 
     header_container = st.container()
     with header_container:
@@ -437,6 +531,14 @@ def main() -> None:
     deltaM = _to_numpy(rec.get("deltaM"))
 
     Rs = _to_numpy(rec.get("R_scenarios"))
+    Rs_port = Rs
+    P_port = P
+    rs_trunc_note = None
+    if Rs is not None and P is not None and Rs.shape[1] != P.shape[1]:
+        n_assets = min(Rs.shape[1], P.shape[1])
+        Rs_port = Rs[:, :n_assets]
+        P_port = P[:, :n_assets]
+        rs_trunc_note = f"Scenarios stored for {Rs.shape[1]} of {P.shape[1]} instruments."
     var_cur = None
     es_cur = None
     var_tent = None
@@ -445,15 +547,15 @@ def main() -> None:
     var_tent = _to_numpy(rec.get("var_tent"))
     es_cur = M_req_cur if M_req_cur is not None else None
     es_tent = M_req_tent if M_req_tent is not None else None
-    if (var_cur is None or (phase in {"trades", "decision"} and var_tent is None)) and Rs is not None and P is not None:
+    if (var_cur is None or (phase in {"trades", "decision"} and var_tent is None)) and Rs_port is not None and P_port is not None:
         try:
-            var_cur_fallback, es_cur_fallback = _portfolio_var_es(P, Rs, alpha=0.99)
+            var_cur_fallback, es_cur_fallback = _portfolio_var_es(P_port, Rs_port, alpha=0.99)
             if var_cur is None:
                 var_cur = var_cur_fallback
             if es_cur is None:
                 es_cur = es_cur_fallback
             if phase in {"trades", "decision"} and DeltaP is not None:
-                var_tent_fallback, es_tent_fallback = _portfolio_var_es(P + DeltaP, Rs, alpha=0.99)
+                var_tent_fallback, es_tent_fallback = _portfolio_var_es(P_port + DeltaP[:, : P_port.shape[1]], Rs_port, alpha=0.99)
                 if var_tent is None:
                     var_tent = var_tent_fallback
                 if es_tent is None:
@@ -463,6 +565,19 @@ def main() -> None:
 
     if alive is None and W is not None:
         alive = np.ones(W.shape[0], dtype=bool)
+
+    default_loss_total = rec.get("default_loss_total")
+    if default_loss_total is None:
+        for phase_key in ("end", "settlement", "decision", "trades", "default", "margin"):
+            day_rec = by_day.get(day, {}).get(phase_key)
+            if day_rec is not None and day_rec.get("default_loss_total") is not None:
+                default_loss_total = day_rec.get("default_loss_total")
+                break
+    default_loss = _to_numpy(rec.get("default_loss"))
+    if default_loss is None:
+        settlement_rec = by_day.get(day, {}).get("settlement")
+        if settlement_rec is not None:
+            default_loss = _to_numpy(settlement_rec.get("default_loss"))
 
     market_state_names = {0: "Calm", 1: "Volatile", 2: "Crisis"}
     with header_container:
@@ -477,6 +592,11 @@ def main() -> None:
                         f"Market state: <span style='color:{state_color};'>{state_name} ({z_t})</span>"
                         "</div>"
                     ),
+                    unsafe_allow_html=True,
+                )
+            if default_loss_total is not None:
+                st.markdown(
+                    f"<div style='font-size:14px;color:#ffffff;'>Default loss (total): {_format_val(float(default_loss_total), 2)}</div>",
                     unsafe_allow_html=True,
                 )
         with market_row[1]:
@@ -506,22 +626,26 @@ def main() -> None:
 
     top_cols = st.columns([3.2, 4, 2.4])
     with top_cols[0]:
-        stats_cols = ["Alive", "W", "C"]
+        stats_cols = ["DL", "W", "F", "C"]
         stats_data = []
-        if alive is None:
+        if default_loss is None:
             stats_data.append(np.full((client_count or 0,), np.nan))
         else:
-            stats_data.append(alive.astype(float))
+            stats_data.append(default_loss)
         if W is None:
             stats_data.append(np.full((client_count or 0,), np.nan))
         else:
             stats_data.append(W)
+        if W is None or C is None:
+            stats_data.append(np.full((client_count or 0,), np.nan))
+        else:
+            stats_data.append(W - C)
         if C is None:
             stats_data.append(np.full((client_count or 0,), np.nan))
         else:
             stats_data.append(C)
 
-        if phase in {"margin", "trades", "decision"}:
+        if phase in {"margin", "default", "trades", "decision"}:
             stats_cols.append("M")
             if M_req_cur is not None:
                 stats_data.append(M_req_cur)
@@ -530,7 +654,7 @@ def main() -> None:
             else:
                 stats_data.append(np.full((client_count or 0,), np.nan))
 
-        if phase == "market":
+        if phase in {"market_move", "market"}:
             stats_cols.append("PnL")
             if pnl is None:
                 stats_data.append(np.full((client_count or 0,), np.nan))
@@ -552,11 +676,29 @@ def main() -> None:
                 pnl_col = stats_matrix[:, idx]
                 max_abs = float(np.nanmax(np.abs(pnl_col))) if pnl_col.size and not np.all(np.isnan(pnl_col)) else 0.0
                 color_rules["PnL"] = {"pos_rgb": (34, 197, 94), "neg_rgb": (239, 68, 68), "max_abs": max_abs}
+            if phase == "margin" and "M" in stats_cols and "C" in stats_cols:
+                idx_m = stats_cols.index("M")
+                idx_c = stats_cols.index("C")
+                m_col = stats_matrix[:, idx_m]
+                c_col = stats_matrix[:, idx_c]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    pct_diff = np.where(
+                        np.isfinite(m_col) & (np.abs(m_col) > 1e-12),
+                        (c_col - m_col) / m_col,
+                        0.0,
+                    )
+                max_abs = float(np.nanmax(np.abs(pct_diff))) if pct_diff.size and not np.all(np.isnan(pct_diff)) else 0.0
+                color_rules["M"] = {
+                    "pos_rgb": (34, 197, 94),
+                    "neg_rgb": (239, 68, 68),
+                    "max_abs": max_abs,
+                    "values": pct_diff,
+                }
             if "DeltaM" in stats_cols:
                 idx = stats_cols.index("DeltaM")
                 dm_col = stats_matrix[:, idx]
                 max_abs = float(np.nanmax(np.abs(dm_col))) if dm_col.size and not np.all(np.isnan(dm_col)) else 0.0
-                color_rules["DeltaM"] = {"pos_rgb": (249, 115, 22), "neg_rgb": (59, 130, 246), "max_abs": max_abs}
+                color_rules["DeltaM"] = {"pos_rgb": (239, 68, 68), "neg_rgb": (34, 197, 94), "max_abs": max_abs}
             st.markdown(
                 _stats_table_html(
                     title="Client Stats",
@@ -597,7 +739,7 @@ def main() -> None:
                 )
 
     with top_cols[2]:
-        if phase == "margin" and var_cur is not None and es_cur is not None:
+        if phase in {"margin", "default"} and var_cur is not None and es_cur is not None:
             cur_matrix = np.vstack([var_cur, es_cur]).T
             st.markdown(
                 _matrix_table_html(
@@ -656,7 +798,7 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
-    show_scenarios = phase in {"margin", "trades", "decision"}
+    show_scenarios = phase in {"margin", "default", "trades", "decision"}
     var_inst = None
     es_inst = None
     if Rs is not None:
@@ -716,6 +858,10 @@ def main() -> None:
         budget = rec.get("budget_B")
         penalty = rec.get("lambda_budget")
         energy = rec.get("qubo_energy")
+        qubo_num_vars = rec.get("qubo_num_vars")
+        qubo_num_interactions = rec.get("qubo_num_interactions")
+        qubo_solver = rec.get("qubo_solver")
+        qubo_solve_time = rec.get("qubo_solve_time_s")
         accepted = int(qubo_x.sum()) if qubo_x is not None else None
         total = int(qubo_x.shape[0]) if qubo_x is not None else None
         sum_delta = float(np.dot(qubo_delta, qubo_x)) if qubo_delta is not None and qubo_x is not None else None
@@ -726,6 +872,13 @@ def main() -> None:
         qubo_rows.append({"label": "Budget B", "value": _format_val(float(budget), 2) if budget is not None else "n/a"})
         qubo_rows.append({"label": "Penalty", "value": _format_val(float(penalty), 2) if penalty is not None else "n/a"})
         qubo_rows.append({"label": "Energy", "value": _format_val(float(energy), 2) if energy is not None else "n/a"})
+        if qubo_num_vars is not None or qubo_num_interactions is not None:
+            size_val = f"vars={qubo_num_vars}, interactions={qubo_num_interactions}"
+        else:
+            size_val = "n/a"
+        qubo_rows.append({"label": "QUBO size", "value": size_val})
+        qubo_rows.append({"label": "Solver", "value": str(qubo_solver) if qubo_solver is not None else "n/a"})
+        qubo_rows.append({"label": "Solve time", "value": f"{float(qubo_solve_time):.3f}s" if qubo_solve_time is not None else "n/a"})
         if accepted is not None and total is not None:
             qubo_rows.append({"label": "Accepted", "value": f"{accepted} / {total}"})
         qubo_df = pd.DataFrame(qubo_rows)
@@ -761,24 +914,30 @@ def main() -> None:
                         idx = int(inst_choice.split("_")[1]) - 1
                     except Exception:
                         idx = inst_cols.index(inst_choice) if inst_choice in inst_cols else 0
-                    series = Rs[:, idx]
-                    fig2, ax2 = plt.subplots(figsize=(4.4, 2.6))
-                    ax2.hist(series, bins=12, color="#f59e0b", edgecolor="#92400e")
-                    ax2.set_title(f"{inst_choice} scenario returns")
-                    ax2.set_xlabel("return")
-                    ax2.set_ylabel("count")
-                    if var_inst is not None and idx < len(var_inst):
-                        ax2.axvline(-var_inst[idx], color="#ef4444", linestyle="--", linewidth=1.2)
-                        ax2.text(-var_inst[idx], ax2.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
-                    fig2.tight_layout()
-                    st.pyplot(fig2)
+                    if idx >= Rs.shape[1]:
+                        st.caption(f"Scenario returns stored for first {Rs.shape[1]} instruments.")
+                    else:
+                        series = Rs[:, idx]
+                        fig2, ax2 = plt.subplots(figsize=(4.4, 2.6))
+                        ax2.hist(series, bins=12, color="#f59e0b", edgecolor="#92400e")
+                        ax2.set_title(f"{inst_choice} scenario returns")
+                        ax2.set_xlabel("return")
+                        ax2.set_ylabel("count")
+                        if var_inst is not None and idx < len(var_inst):
+                            ax2.axvline(-var_inst[idx], color="#ef4444", linestyle="--", linewidth=1.2)
+                            ax2.text(-var_inst[idx], ax2.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
+                        fig2.tight_layout()
+                        st.pyplot(fig2)
                 else:
-                    st.caption("Scenario distribution available in PnL & Margins, Suggested Trades, and QUBO Clearing phases.")
+                    st.caption("Scenario distribution available in Margins, Default, Suggested Trades, and QUBO Clearing phases.")
 
     with st.expander("Client view", expanded=False):
         pnl_df = _pnl_dataframe(records)
         if not pnl_df.empty:
             pnl_df = pnl_df[pnl_df["day"] <= day]
+        wealth_df = _wealth_dataframe(records)
+        if not wealth_df.empty:
+            wealth_df = wealth_df[wealth_df["day"] <= day]
         if row_labels_clients:
             cl_choice = st.selectbox("Client", row_labels_clients, index=0, key="client_view")
         else:
@@ -786,6 +945,26 @@ def main() -> None:
 
         client_cols = st.columns(2)
         with client_cols[0]:
+            if cl_choice is None or wealth_df.empty or cl_choice not in wealth_df.columns:
+                st.caption("Wealth history not available.")
+            else:
+                series = wealth_df[cl_choice].to_numpy()
+                valid = np.isfinite(series)
+                if not np.any(valid):
+                    st.caption("Wealth history not available.")
+                else:
+                    base = float(series[valid][0])
+                    figw, axw = plt.subplots(figsize=(4.4, 2.6))
+                    axw.plot(wealth_df["day"], series, color="#111827", linewidth=1.5)
+                    colors = ["#22c55e" if val >= base else "#ef4444" for val in series]
+                    axw.scatter(wealth_df["day"], series, c=colors, s=24, zorder=3)
+                    axw.axhline(base, color="#9ca3af", linestyle="--", linewidth=1.2)
+                    axw.set_title(f"{cl_choice} wealth (to day {day})")
+                    axw.set_xlabel("day")
+                    axw.set_ylabel("wealth")
+                    figw.tight_layout()
+                    st.pyplot(figw)
+
             if cl_choice is None or pnl_df.empty or cl_choice not in pnl_df.columns:
                 st.caption("PnL history not available.")
             else:
@@ -798,19 +977,19 @@ def main() -> None:
                 st.pyplot(fig3)
 
         with client_cols[1]:
-            if show_scenarios and Rs is not None and P is not None and cl_choice is not None:
+            if show_scenarios and Rs_port is not None and P_port is not None and cl_choice is not None:
                 try:
                     cl_idx = int(cl_choice.split("_")[1]) - 1
                 except Exception:
                     cl_idx = row_labels_clients.index(cl_choice) if cl_choice in row_labels_clients else 0
-                losses = -(Rs @ P[cl_idx])
+                losses = -(Rs_port @ P_port[cl_idx])
                 fig4, ax4 = plt.subplots(figsize=(4.4, 2.6))
                 ax4.hist(losses, bins=12, color="#94a3b8", edgecolor="#334155")
                 ax4.set_title(f"{cl_choice} portfolio loss")
                 ax4.set_xlabel("loss")
                 ax4.set_ylabel("count")
                 var_line = None
-                if phase == "margin" and var_cur is not None:
+                if phase in {"margin", "default"} and var_cur is not None:
                     var_line = var_cur
                 elif phase in {"trades", "decision"} and var_tent is not None:
                     var_line = var_tent
@@ -821,8 +1000,10 @@ def main() -> None:
                     ax4.text(var_line[cl_idx], ax4.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
                 fig4.tight_layout()
                 st.pyplot(fig4)
+                if rs_trunc_note is not None:
+                    st.caption(rs_trunc_note)
             else:
-                st.caption("Scenario risk available in PnL & Margins, Suggested Trades, and QUBO Clearing phases.")
+                st.caption("Scenario risk available in Margins, Default, Suggested Trades, and QUBO Clearing phases.")
 
 
 if __name__ == "__main__":

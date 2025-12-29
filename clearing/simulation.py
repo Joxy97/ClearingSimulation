@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Dict, Optional, Literal
 
 import torch
@@ -33,6 +34,7 @@ def simulate_day(
     P: torch.Tensor,
     W: torch.Tensor,
     C: torch.Tensor,
+    default_loss: Optional[torch.Tensor] = None,
     alive: torch.Tensor,
     z_prev: int,
     r_prev: torch.Tensor,
@@ -64,6 +66,10 @@ def simulate_day(
         raise ValueError("W must be [M]")
     if C.shape != (M,):
         raise ValueError("C must be [M]")
+    if default_loss is None:
+        default_loss = torch.zeros_like(W)
+    if default_loss.shape != (M,):
+        raise ValueError("default_loss must be [M]")
     if alive.shape != (M,):
         raise ValueError("alive must be [M]")
     if r_prev.shape != (N,):
@@ -75,21 +81,44 @@ def simulate_day(
     P = P.to(device=device)
     W = W.to(device=device)
     C = C.to(device=device)
+    default_loss = default_loss.to(device=device)
     alive = alive.to(device=device, dtype=torch.bool)
     r_prev = r_prev.to(device=device)
 
     d = 0 if day is None else int(day)
 
     if logger is not None:
-        logger.log(day=d, phase="start", P=P, W=W, C=C, alive=alive, z_t=int(z_prev), r_t=r_prev)
+        logger.log(day=d, phase="start", P=P, W=W, C=C, alive=alive, z_t=int(z_prev), r_t=r_prev, default_loss=default_loss)
 
     z_t, r_t, _d_t = generate_day(z_prev, r_prev, market_params, generator=g_market)
 
     pnl = (P * r_t[None, :]).sum(dim=1)
-    W_after_pnl = W + pnl
 
     if logger is not None:
-        logger.log(day=d, phase="market", P=P, W=W_after_pnl, C=C, alive=alive, z_t=int(z_t), r_t=r_t, pnl=pnl)
+        logger.log(day=d, phase="market_move", P=P, W=W, C=C, alive=alive, z_t=int(z_t), r_t=r_t, pnl=pnl, default_loss=default_loss)
+
+    W_settle = W + pnl
+    F_pre = (W - C) + pnl
+    C_after_f = C + torch.minimum(F_pre, torch.zeros_like(F_pre))
+    default_loss_step = (-C_after_f).clamp(min=0.0)
+    C_after_f = C_after_f.clamp(min=0.0)
+    W_settle = torch.maximum(W_settle, torch.zeros_like(W_settle))
+    default_loss = default_loss + default_loss_step
+    default_loss_total = float(default_loss.sum().item())
+
+    if logger is not None:
+        logger.log(
+            day=d,
+            phase="settlement",
+            P=P,
+            W=W_settle,
+            C=C_after_f,
+            alive=alive,
+            z_t=int(z_t),
+            r_t=r_t,
+            default_loss=default_loss,
+            default_loss_total=default_loss_total,
+        )
 
     R_scenarios = sample_scenarios_from_float(
         model=rbm_model,
@@ -104,33 +133,52 @@ def simulate_day(
     )
 
     M_req_cur, var_cur = margin_es(P, R_scenarios, alpha=sim_params.alpha, return_var=True)
-    default_now = alive & (W_after_pnl < M_req_cur)
-    alive_new = alive & (~default_now)
-
-    if sim_params.post_full_margin_daily:
-        C_new = torch.where(alive_new, torch.minimum(W_after_pnl, M_req_cur), C)
-    else:
-        need = alive_new & (C < M_req_cur)
-        topup = torch.minimum(W_after_pnl - C, M_req_cur - C).clamp(min=0.0)
-        C_new = torch.where(need, C + topup, C)
-
-    P_liq = torch.where(alive_new[:, None], P, torch.zeros_like(P))
-    W_new = torch.where(alive_new, W_after_pnl, torch.zeros_like(W_after_pnl))
 
     if logger is not None:
         logger.log(
             day=d,
             phase="margin",
+            P=P,
+            W=W_settle,
+            C=C_after_f,
+            alive=alive,
+            z_t=int(z_t),
+            r_t=r_t,
+            M_req_cur=M_req_cur,
+            var_cur=var_cur,
+            default_loss=default_loss,
+            default_loss_total=default_loss_total,
+            R_scenarios=(R_scenarios if log_scenarios else None),
+        )
+
+    F_available = (W_settle - C_after_f).clamp(min=0.0)
+    need = (M_req_cur - C_after_f).clamp(min=0.0)
+    can_topup = F_available >= need
+    default_now = alive & (~can_topup)
+    alive_new = alive & can_topup
+
+    if sim_params.post_full_margin_daily:
+        C_new = torch.where(alive_new, C_after_f + need, torch.zeros_like(C_after_f))
+    else:
+        C_new = torch.where(alive_new, C_after_f + need, torch.zeros_like(C_after_f))
+
+    P_liq = torch.where(alive_new[:, None], P, torch.zeros_like(P))
+    W_new = W_settle
+
+    if logger is not None:
+        logger.log(
+            day=d,
+            phase="default",
             P=P_liq,
             W=W_new,
             C=C_new,
             alive=alive_new,
             z_t=int(z_t),
             r_t=r_t,
-            pnl=pnl,
             M_req_cur=M_req_cur,
             var_cur=var_cur,
-            R_scenarios=(R_scenarios if log_scenarios else None),
+            default_loss=default_loss,
+            default_loss_total=default_loss_total,
         )
 
     DeltaP = propose_trades(P_liq, r_t, trade_params, alive=alive_new, generator=g_trade)
@@ -155,6 +203,8 @@ def simulate_day(
             var_tent=var_tent,
             deltaM=deltaM,
             DeltaP=DeltaP,
+            default_loss=default_loss,
+            default_loss_total=default_loss_total,
             R_scenarios=(R_scenarios if log_scenarios else None),
         )
 
@@ -172,6 +222,9 @@ def simulate_day(
         eta_risk=sim_params.eta_risk,
     )
 
+    qubo_num_vars = len(bqm.variables)
+    qubo_num_interactions = len(bqm.quadratic)
+    t0 = time.perf_counter()
     x, energy = solve_bqm(
         bqm,
         method=sim_params.qubo_solver,
@@ -180,6 +233,7 @@ def simulate_day(
         time_limit=sim_params.leap_time_limit,
         out_device=str(device),
     )
+    solve_time_s = time.perf_counter() - t0
 
     if logger is not None:
         logger.log(
@@ -191,16 +245,24 @@ def simulate_day(
             alive=alive_new,
             z_t=int(z_t),
             r_t=r_t,
+            M_req_cur=M_req_cur,
+            M_req_tent=M_req_tent,
             deltaM=deltaM,
             DeltaP=DeltaP,
             x=x,
             qubo_energy=energy,
+            qubo_num_vars=qubo_num_vars,
+            qubo_num_interactions=qubo_num_interactions,
+            qubo_solver=sim_params.qubo_solver,
+            qubo_solve_time_s=solve_time_s,
             budget_B=sim_params.budget_B,
             lambda_budget=sim_params.lambda_budget,
             eta_risk=sim_params.eta_risk,
             utility_weight=sim_params.utility_weight,
             var_cur=var_cur,
             var_tent=var_tent,
+            default_loss=default_loss,
+            default_loss_total=default_loss_total,
             R_scenarios=(R_scenarios if log_scenarios else None),
         )
 
@@ -208,10 +270,7 @@ def simulate_day(
     P_next = P_liq + x_f[:, None] * DeltaP
 
     M_req_next = margin_es(P_next, R_scenarios, alpha=sim_params.alpha)
-    if sim_params.post_full_margin_daily:
-        C_next = torch.where(alive_new, torch.minimum(W_new, M_req_next), C_new)
-    else:
-        C_next = C_new
+    C_next = C_new
 
     z_prev_next = int(z_t)
     r_prev_next = r_t
@@ -230,6 +289,8 @@ def simulate_day(
             M_req_cur=M_req_next,
             x=x,
             qubo_energy=energy,
+            default_loss=default_loss,
+            default_loss_total=default_loss_total,
         )
 
     out = {
@@ -245,6 +306,8 @@ def simulate_day(
         "M_req_cur": M_req_cur,
         "M_req_tent": M_req_tent,
         "deltaM": deltaM,
+        "default_loss": default_loss,
+        "default_loss_total": float(default_loss_total),
         "default_now": default_now,
         "x": x,
         "qubo_energy": float(energy),

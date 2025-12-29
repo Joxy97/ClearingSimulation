@@ -9,7 +9,7 @@ import torch
 @dataclass
 class TradeParams:
     momentum_weight: float = 1.0
-    gamma_exposure: float = 0.5
+    gamma_exposure: float = 1.0
 
     base_scale: float = 10.0
 

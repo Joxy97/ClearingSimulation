@@ -17,7 +17,7 @@ from clearing.market import make_default_params  # noqa: E402
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate synthetic market data and export RBM-ready bits.")
     parser.add_argument("--T", type=int, default=10000, help="Number of days to simulate.")
-    parser.add_argument("--N", type=int, default=5, help="Number of instruments.")
+    parser.add_argument("--N", type=int, default=500, help="Number of instruments.")
     parser.add_argument("--S", type=int, default=3, help="Number of market states.")
     parser.add_argument("--F", type=int, default=2, help="Number of factors.")
     parser.add_argument("--K", type=int, default=4, help="Bits per instrument for quantization.")

@@ -16,7 +16,7 @@ def _cpu(x):
 
 @dataclass
 class LogConfig:
-    log_phases: tuple[str, ...] = ("start", "market", "margin", "trades", "decision", "end")
+    log_phases: tuple[str, ...] = ("start", "market_move", "settlement", "market", "margin", "default", "trades", "decision", "end")
     store_scenarios: bool = False
     scenarios_max_omega: int = 300
     scenarios_max_assets: int = 50
@@ -49,6 +49,12 @@ class SimLogger:
         DeltaP: Optional[torch.Tensor] = None,
         x: Optional[torch.Tensor] = None,
         qubo_energy: Optional[float] = None,
+        qubo_num_vars: Optional[int] = None,
+        qubo_num_interactions: Optional[int] = None,
+        qubo_solver: Optional[str] = None,
+        qubo_solve_time_s: Optional[float] = None,
+        default_loss: Optional[torch.Tensor] = None,
+        default_loss_total: Optional[float] = None,
         R_scenarios: Optional[torch.Tensor] = None,
         budget_B: Optional[float] = None,
         lambda_budget: Optional[float] = None,
@@ -76,6 +82,17 @@ class SimLogger:
         rec["DeltaP"] = _cpu(DeltaP)
         rec["x"] = _cpu(x)
         rec["qubo_energy"] = None if qubo_energy is None else float(qubo_energy)
+        rec["default_loss"] = _cpu(default_loss)
+        if default_loss_total is not None:
+            rec["default_loss_total"] = float(default_loss_total)
+        if qubo_num_vars is not None:
+            rec["qubo_num_vars"] = int(qubo_num_vars)
+        if qubo_num_interactions is not None:
+            rec["qubo_num_interactions"] = int(qubo_num_interactions)
+        if qubo_solver is not None:
+            rec["qubo_solver"] = str(qubo_solver)
+        if qubo_solve_time_s is not None:
+            rec["qubo_solve_time_s"] = float(qubo_solve_time_s)
         if budget_B is not None:
             rec["budget_B"] = float(budget_B)
         if lambda_budget is not None:
