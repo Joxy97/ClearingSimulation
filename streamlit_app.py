@@ -9,6 +9,26 @@ import streamlit as st
 import torch
 import matplotlib.pyplot as plt
 
+
+def _blend_color(base_rgb: tuple[int, int, int], intensity: float) -> str:
+    intensity = max(0.0, min(1.0, float(intensity)))
+    r = int(255 * (1.0 - intensity) + base_rgb[0] * intensity)
+    g = int(255 * (1.0 - intensity) + base_rgb[1] * intensity)
+    b = int(255 * (1.0 - intensity) + base_rgb[2] * intensity)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _color_from_value(val: float, max_abs: float, pos_rgb: tuple[int, int, int], neg_rgb: tuple[int, int, int]) -> Optional[str]:
+    if np.isnan(val) or np.isnan(max_abs):
+        return None
+    if max_abs <= 0:
+        return None
+    if abs(val) <= 1e-12:
+        return None
+    intensity = min(abs(val) / max_abs, 1.0)
+    base = pos_rgb if val > 0 else neg_rgb
+    return _blend_color(base, intensity)
+
 PHASE_ORDER = ["start", "market", "margin", "trades", "decision", "end"]
 PHASE_LABELS = {
     "start": "Start",
@@ -111,7 +131,7 @@ def _matrix_table_html(
             if cell_color is not None:
                 color = cell_color(i, j)
                 if color:
-                    c_style = f" style='background-color:{color};'"
+                    c_style = f" style='background-color:{color}; color:#111827;'"
             val = _format_val(float(data[i, j]), decimals)
             note = ""
             if cell_note is not None:
@@ -161,6 +181,7 @@ def _stats_table_html(
     alive: Optional[np.ndarray],
     max_rows: int,
     decimals: int = 2,
+    color_rules: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> str:
     def row_color(i: int) -> Optional[str]:
         if alive is None:
@@ -170,7 +191,20 @@ def _stats_table_html(
     def cell_color(i: int, j: int) -> Optional[str]:
         if alive is None:
             return None
-        return "#e8e8e8" if not bool(alive[i]) else None
+        if not bool(alive[i]):
+            return "#e8e8e8"
+        if color_rules is None:
+            return None
+        col = col_labels[j]
+        rule = color_rules.get(col) if color_rules else None
+        if not rule:
+            return None
+        return _color_from_value(
+            float(data[i, j]),
+            float(rule["max_abs"]),
+            rule["pos_rgb"],
+            rule["neg_rgb"],
+        )
 
     return _matrix_table_html(
         title=title,
@@ -221,7 +255,7 @@ def _portfolio_table_html(
         sign = "+" if dp >= 0 else ""
         return f"{sign}{dp:.2f}"
 
-    row_labels = [f"c{i + 1}" for i in range(P.shape[0])]
+    row_labels = [f"cl_{i + 1}" for i in range(P.shape[0])]
     col_labels = [f"inst_{j + 1}" for j in range(P.shape[1])]
 
     return _matrix_table_html(
@@ -250,23 +284,36 @@ def _compute_var_es(R_scenarios: np.ndarray, alpha: float = 0.99) -> tuple[np.nd
     return var, es
 
 
+def _portfolio_var_es(P: np.ndarray, R_scenarios: np.ndarray, alpha: float = 0.99) -> tuple[np.ndarray, np.ndarray]:
+    if P.ndim != 2:
+        raise ValueError("P must be [M, N].")
+    if R_scenarios.ndim != 2 or R_scenarios.shape[1] != P.shape[1]:
+        raise ValueError("R_scenarios must be [omega, N] matching P.")
+    losses = -(R_scenarios @ P.T)
+    var = np.quantile(losses, alpha, axis=0)
+    es = np.zeros_like(var)
+    for i in range(losses.shape[1]):
+        tail = losses[:, i][losses[:, i] >= var[i]]
+        es[i] = tail.mean() if tail.size else var[i]
+    return var, es
+
+
 def main() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background-color: #f8fafc; }
-        .tensor-title { font-weight: 700; margin-bottom: 6px; color: #1f2937; }
+        .tensor-title { font-weight: 700; margin-bottom: 6px; }
         .tensor-wrap { overflow-x: auto; }
-        table.tensor-table { border-collapse: collapse; width: 100%; background: #fff; }
+        table.tensor-table { border-collapse: collapse; width: 100%; }
         table.tensor-table th, table.tensor-table td {
-            border: 1px solid #cfcfcf; padding: 6px 8px; text-align: center; font-size: 12px; color: #111827;
+            border: 1px solid #cfcfcf; padding: 6px 8px; text-align: center; font-size: 12px;
             width: 56px; height: 36px;
         }
         table.tensor-table { table-layout: fixed; }
-        table.tensor-table th { background: #f3f4f6; font-weight: 600; color: #1f2937; }
-        .cell-val { font-weight: 600; font-size: 12px; color: #111827; }
-        .cell-note { font-size: 10px; color: #4b5563; }
-        .section-label { font-weight: 700; color: #1f2937; margin-bottom: 6px; }
+        table.tensor-table th { background: transparent; font-weight: 600; }
+        .cell-val { font-weight: 600; font-size: 12px; }
+        .cell-note { font-size: 10px; }
+        .section-label { font-weight: 700; margin-bottom: 6px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -356,6 +403,21 @@ def main() -> None:
         DeltaP = None
         x = None
 
+    deltaM = _to_numpy(rec.get("deltaM"))
+
+    Rs = _to_numpy(rec.get("R_scenarios"))
+    var_cur = None
+    es_cur = None
+    var_tent = None
+    es_tent = None
+    if Rs is not None and P is not None:
+        try:
+            var_cur, es_cur = _portfolio_var_es(P, Rs, alpha=0.99)
+            if phase in {"trades", "decision"} and DeltaP is not None:
+                var_tent, es_tent = _portfolio_var_es(P + DeltaP, Rs, alpha=0.99)
+        except Exception:
+            var_cur, es_cur, var_tent, es_tent = None, None, None, None
+
     if alive is None and W is not None:
         alive = np.ones(W.shape[0], dtype=bool)
 
@@ -369,7 +431,7 @@ def main() -> None:
             client_count = vec.shape[0]
             break
     if client_count is not None:
-        row_labels_clients = [f"{i + 1}" for i in range(client_count)]
+        row_labels_clients = [f"cl_{i + 1}" for i in range(client_count)]
 
     row_labels_instruments = []
     inst_count = None
@@ -380,25 +442,14 @@ def main() -> None:
     if inst_count is not None:
         row_labels_instruments = [f"inst_{i + 1}" for i in range(inst_count)]
 
-    top_cols = st.columns([1, 2, 4])
+    top_cols = st.columns([3.2, 4, 2.4])
     with top_cols[0]:
-        if alive is not None:
-            alive_vec = alive.astype(int)
-            st.markdown(
-                _vector_table_html(
-                    title="Client",
-                    data=alive_vec,
-                    row_labels=row_labels_clients,
-                    max_rows=max_clients,
-                    col_label="Alive",
-                    decimals=0,
-                ),
-                unsafe_allow_html=True,
-            )
-
-    with top_cols[1]:
-        stats_cols = ["W", "C", "M", "PnL"]
+        stats_cols = ["Alive", "W", "C", "M", "PnL"]
         stats_data = []
+        if alive is None:
+            stats_data.append(np.full((client_count or 0,), np.nan))
+        else:
+            stats_data.append(alive.astype(float))
         if W is None:
             stats_data.append(np.full((client_count or 0,), np.nan))
         else:
@@ -417,22 +468,40 @@ def main() -> None:
             stats_data.append(np.full((client_count or 0,), np.nan))
         else:
             stats_data.append(pnl)
+        if phase == "trades":
+            stats_cols.append("DeltaM")
+            if deltaM is None:
+                stats_data.append(np.full((client_count or 0,), np.nan))
+            else:
+                stats_data.append(deltaM)
 
         if stats_data:
             stats_matrix = np.vstack(stats_data).T
+            color_rules = {}
+            if "PnL" in stats_cols:
+                idx = stats_cols.index("PnL")
+                pnl_col = stats_matrix[:, idx]
+                max_abs = float(np.nanmax(np.abs(pnl_col))) if pnl_col.size and not np.all(np.isnan(pnl_col)) else 0.0
+                color_rules["PnL"] = {"pos_rgb": (34, 197, 94), "neg_rgb": (239, 68, 68), "max_abs": max_abs}
+            if "DeltaM" in stats_cols:
+                idx = stats_cols.index("DeltaM")
+                dm_col = stats_matrix[:, idx]
+                max_abs = float(np.nanmax(np.abs(dm_col))) if dm_col.size and not np.all(np.isnan(dm_col)) else 0.0
+                color_rules["DeltaM"] = {"pos_rgb": (249, 115, 22), "neg_rgb": (59, 130, 246), "max_abs": max_abs}
             st.markdown(
                 _stats_table_html(
-                    title="Stats",
+                    title="Client Stats",
                     data=stats_matrix,
                     row_labels=row_labels_clients,
                     col_labels=stats_cols,
                     alive=alive,
                     max_rows=max_clients,
+                    color_rules=color_rules,
                 ),
                 unsafe_allow_html=True,
             )
 
-    with top_cols[2]:
+    with top_cols[1]:
         if P is not None:
             st.markdown(
                 _portfolio_table_html(
@@ -443,8 +512,8 @@ def main() -> None:
                     max_rows=max_clients,
                     max_cols=max_assets,
                 ),
-                unsafe_allow_html=True,
-            )
+                    unsafe_allow_html=True,
+                )
             if phase in {"trades", "decision"}:
                 st.markdown(
                     """
@@ -458,105 +527,181 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
 
-    bottom_cols = st.columns([1.4, 2.4, 1.2, 1.2, 2.0])
-    with bottom_cols[0]:
-        if r_t is not None:
-            st.markdown(
-                _vector_table_html(
-                    title="Returns",
-                    data=r_t,
-                    row_labels=row_labels_instruments,
-                    max_rows=max_assets,
-                    col_label="Return",
-                ),
-                unsafe_allow_html=True,
-            )
-
-    Rs = _to_numpy(rec.get("R_scenarios"))
-    var_vec = None
-    es_vec = None
-    if Rs is not None:
-        try:
-            var_vec, es_vec = _compute_var_es(Rs, alpha=0.99)
-        except Exception:
-            var_vec, es_vec = None, None
-
-    with bottom_cols[1]:
-        if Rs is None:
-            st.caption("Scenario matrix not stored.")
-        else:
-            omega = min(Rs.shape[0], max_scenarios)
-            assets = min(Rs.shape[1], max_assets)
-            Rs_view = Rs[:omega, :assets].T
-            row_labels = [f"inst_{i + 1}" for i in range(Rs_view.shape[0])]
-            col_labels = [f"sc_{j + 1}" for j in range(Rs_view.shape[1])]
+    with top_cols[2]:
+        if phase == "margin" and var_cur is not None and es_cur is not None:
+            cur_matrix = np.vstack([var_cur, es_cur]).T
             st.markdown(
                 _matrix_table_html(
-                    title="Scenarios",
-                    data=Rs_view,
-                    row_labels=row_labels,
-                    col_labels=col_labels,
+                    title="VaR / ES (current)",
+                    data=cur_matrix,
+                    row_labels=row_labels_clients,
+                    col_labels=["VaR 99", "ES 99"],
                     cell_color=None,
                     cell_note=None,
                     row_color=None,
-                    max_rows=assets,
-                    max_cols=omega,
+                    max_rows=max_clients,
+                    max_cols=2,
+                    decimals=2,
+                ),
+                unsafe_allow_html=True,
+            )
+        elif phase in {"trades", "decision"} and var_tent is not None and es_tent is not None:
+            tent_matrix = np.vstack([var_tent, es_tent]).T
+            st.markdown(
+                _matrix_table_html(
+                    title="VaR / ES (tentative)",
+                    data=tent_matrix,
+                    row_labels=row_labels_clients,
+                    col_labels=["VaR 99", "ES 99"],
+                    cell_color=None,
+                    cell_note=None,
+                    row_color=None,
+                    max_rows=max_clients,
+                    max_cols=2,
                     decimals=2,
                 ),
                 unsafe_allow_html=True,
             )
 
+    bottom_cols = st.columns([1.4, 2.6, 1.6])
+    with bottom_cols[0]:
+        if r_t is not None:
+            max_abs = float(np.max(np.abs(r_t))) if r_t.size else 0.0
+
+            def ret_color(i: int, j: int) -> Optional[str]:
+                return _color_from_value(float(r_t[i]), max_abs, (34, 197, 94), (239, 68, 68))
+
+            st.markdown(
+                _matrix_table_html(
+                    title="Returns",
+                    data=r_t.reshape(-1, 1),
+                    row_labels=row_labels_instruments,
+                    col_labels=["Return"],
+                    cell_color=ret_color,
+                    cell_note=None,
+                    row_color=None,
+                    max_rows=max_assets,
+                    max_cols=1,
+                    decimals=4,
+                ),
+                unsafe_allow_html=True,
+            )
+
+    show_scenarios = phase in {"margin", "trades", "decision"}
+
+    with bottom_cols[1]:
+        if show_scenarios:
+            if Rs is None:
+                st.caption("Scenario matrix not stored.")
+            else:
+                omega = min(Rs.shape[0], max_scenarios)
+                assets = min(Rs.shape[1], max_assets)
+                Rs_view = Rs[:omega, :assets].T
+                row_labels = [f"inst_{i + 1}" for i in range(Rs_view.shape[0])]
+                col_labels = [f"sc_{j + 1}" for j in range(Rs_view.shape[1])]
+                st.markdown(
+                    _matrix_table_html(
+                        title="Scenarios",
+                        data=Rs_view,
+                        row_labels=row_labels,
+                        col_labels=col_labels,
+                        cell_color=None,
+                        cell_note=None,
+                        row_color=None,
+                        max_rows=assets,
+                        max_cols=omega,
+                        decimals=2,
+                    ),
+                    unsafe_allow_html=True,
+                )
+
     with bottom_cols[2]:
-        if var_vec is not None:
+        if show_scenarios and Rs is not None:
+            var_inst, es_inst = _compute_var_es(Rs, alpha=0.99)
+            inst_matrix = np.vstack([var_inst, es_inst]).T
             st.markdown(
-                _vector_table_html(
-                    title="Value-at-Risk",
-                    data=var_vec[: max_assets],
-                    row_labels=[f"inst_{i + 1}" for i in range(min(len(var_vec), max_assets))],
+                _matrix_table_html(
+                    title="VaR / ES (per inst)",
+                    data=inst_matrix,
+                    row_labels=[f"inst_{i + 1}" for i in range(inst_matrix.shape[0])],
+                    col_labels=["VaR 99", "ES 99"],
+                    cell_color=None,
+                    cell_note=None,
+                    row_color=None,
                     max_rows=max_assets,
-                    col_label="VaR 99",
+                    max_cols=2,
+                    decimals=2,
                 ),
                 unsafe_allow_html=True,
             )
 
-    with bottom_cols[3]:
-        if es_vec is not None:
-            st.markdown(
-                _vector_table_html(
-                    title="ES at 99%",
-                    data=es_vec[: max_assets],
-                    row_labels=[f"inst_{i + 1}" for i in range(min(len(es_vec), max_assets))],
-                    max_rows=max_assets,
-                    col_label="ES 99",
-                ),
-                unsafe_allow_html=True,
-            )
-
-    with bottom_cols[4]:
-        st.markdown("<div class='tensor-title'>Per instrument distribution</div>", unsafe_allow_html=True)
-        if Rs is None:
-            st.caption("Scenarios not available.")
+    with st.expander("Scenario distributions", expanded=False):
+        if show_scenarios:
+            if Rs is None:
+                st.caption("Scenarios not available.")
+            else:
+                hist_cols = st.columns(2)
+                inst_labels = [f"inst_{i + 1}" for i in range(Rs.shape[1])]
+                with hist_cols[0]:
+                    inst_choice = st.selectbox("Instrument", inst_labels, index=0, key="inst_hist")
+                    idx = inst_labels.index(inst_choice)
+                    series = Rs[:, idx]
+                    fig, ax = plt.subplots(figsize=(3.6, 2.4))
+                    ax.hist(series, bins=12, color="#38bdf8", edgecolor="#1e3a8a")
+                    ax.set_title(f"{inst_choice} returns")
+                    ax.set_xlabel("Return")
+                    ax.set_ylabel("Count")
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                with hist_cols[1]:
+                    if P is not None and row_labels_clients:
+                        cl_labels = row_labels_clients
+                        cl_choice = st.selectbox("Client", cl_labels, index=0, key="client_hist")
+                        cl_idx = cl_labels.index(cl_choice)
+                        losses = -(Rs @ P[cl_idx])
+                        fig2, ax2 = plt.subplots(figsize=(3.6, 2.4))
+                        ax2.hist(losses, bins=12, color="#94a3b8", edgecolor="#334155")
+                        ax2.set_title(f"{cl_choice} loss")
+                        ax2.set_xlabel("Loss")
+                        ax2.set_ylabel("Count")
+                        if var_cur is not None and cl_idx < len(var_cur):
+                            ax2.axvline(var_cur[cl_idx], color="#ef4444", linestyle="--", linewidth=1)
+                            ax2.text(var_cur[cl_idx], ax2.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
+                        fig2.tight_layout()
+                        st.pyplot(fig2)
+                    else:
+                        st.caption("Client loss histogram not available.")
         else:
-            inst_labels = [f"inst_{i + 1}" for i in range(Rs.shape[1])]
-            inst_choice = st.selectbox("Instrument", inst_labels, index=0)
-            idx = inst_labels.index(inst_choice)
-            series = Rs[:, idx]
-            fig, ax = plt.subplots(figsize=(3.4, 2.2))
-            ax.hist(series, bins=12, color="#38bdf8", edgecolor="#1e3a8a")
-            ax.set_title(inst_choice)
-            ax.set_xlabel("Return")
-            ax.set_ylabel("Count")
-            if var_vec is not None and idx < len(var_vec):
-                ax.axvline(-var_vec[idx], color="#ef4444", linestyle="--", linewidth=1)
-                ax.text(-var_vec[idx], ax.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
-            fig.tight_layout()
-            st.pyplot(fig)
+            st.caption("Scenario views are available in Pre-Trade, Trades, and Decision phases.")
+
+    if phase == "decision":
+        qubo_delta = _to_numpy(rec.get("deltaM"))
+        qubo_x = _to_numpy(rec.get("x"))
+        budget = rec.get("budget_B")
+        penalty = rec.get("lambda_budget")
+        energy = rec.get("qubo_energy")
+        accepted = int(qubo_x.sum()) if qubo_x is not None else None
+        total = int(qubo_x.shape[0]) if qubo_x is not None else None
+        sum_delta = float(np.dot(qubo_delta, qubo_x)) if qubo_delta is not None and qubo_x is not None else None
+
+        st.markdown("**QUBO summary**")
+        qubo_rows = []
+        qubo_rows.append({"label": "Σ ΔM_i x_i", "value": _format_val(sum_delta, 2) if sum_delta is not None else "n/a"})
+        qubo_rows.append({"label": "Budget B", "value": _format_val(float(budget), 2) if budget is not None else "n/a"})
+        qubo_rows.append({"label": "Penalty", "value": _format_val(float(penalty), 2) if penalty is not None else "n/a"})
+        qubo_rows.append({"label": "Energy", "value": _format_val(float(energy), 2) if energy is not None else "n/a"})
+        if accepted is not None and total is not None:
+            qubo_rows.append({"label": "Accepted", "value": f"{accepted} / {total}"})
+        qubo_df = pd.DataFrame(qubo_rows)
+        st.dataframe(qubo_df, use_container_width=True, hide_index=True)
 
     with st.expander("Returns over days", expanded=False):
         market_df = _market_dataframe(records)
         if not market_df.empty:
-            st.line_chart(market_df.set_index("day")[[c for c in market_df.columns if c.startswith("inst_")]])
-            st.line_chart(market_df.set_index("day")[["z_t"]])
+            market_df = market_df[market_df["day"] <= day]
+            if not market_df.empty:
+                st.line_chart(market_df.set_index("day")[[c for c in market_df.columns if c.startswith("inst_")]])
+                st.line_chart(market_df.set_index("day")[["z_t"]])
         else:
             st.info("No market phase records available.")
 

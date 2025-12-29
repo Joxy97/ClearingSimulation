@@ -152,6 +152,7 @@ def simulate_day(
             M_req_tent=M_req_tent,
             deltaM=deltaM,
             DeltaP=DeltaP,
+            R_scenarios=(R_scenarios if log_scenarios else None),
         )
 
     if sim_params.utility_weight != 0.0:
@@ -191,6 +192,11 @@ def simulate_day(
             DeltaP=DeltaP,
             x=x,
             qubo_energy=energy,
+            budget_B=sim_params.budget_B,
+            lambda_budget=sim_params.lambda_budget,
+            eta_risk=sim_params.eta_risk,
+            utility_weight=sim_params.utility_weight,
+            R_scenarios=(R_scenarios if log_scenarios else None),
         )
 
     x_f = x.to(dtype=P.dtype)

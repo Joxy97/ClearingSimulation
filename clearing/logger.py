@@ -48,6 +48,10 @@ class SimLogger:
         x: Optional[torch.Tensor] = None,
         qubo_energy: Optional[float] = None,
         R_scenarios: Optional[torch.Tensor] = None,
+        budget_B: Optional[float] = None,
+        lambda_budget: Optional[float] = None,
+        eta_risk: Optional[float] = None,
+        utility_weight: Optional[float] = None,
     ) -> None:
         if phase not in self.cfg.log_phases:
             return
@@ -68,6 +72,14 @@ class SimLogger:
         rec["DeltaP"] = _cpu(DeltaP)
         rec["x"] = _cpu(x)
         rec["qubo_energy"] = None if qubo_energy is None else float(qubo_energy)
+        if budget_B is not None:
+            rec["budget_B"] = float(budget_B)
+        if lambda_budget is not None:
+            rec["lambda_budget"] = float(lambda_budget)
+        if eta_risk is not None:
+            rec["eta_risk"] = float(eta_risk)
+        if utility_weight is not None:
+            rec["utility_weight"] = float(utility_weight)
 
         if R_scenarios is not None and self.cfg.store_scenario_stats:
             Rs = R_scenarios.detach()
