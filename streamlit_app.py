@@ -31,12 +31,12 @@ def _color_from_value(val: float, max_abs: float, pos_rgb: tuple[int, int, int],
 
 PHASE_ORDER = ["start", "market", "margin", "trades", "decision", "end"]
 PHASE_LABELS = {
-    "start": "Start",
-    "market": "Market",
-    "margin": "Pre-Trade",
-    "trades": "Trades",
-    "decision": "Decision",
-    "end": "End",
+    "start": "Start of the Day",
+    "market": "Market Update",
+    "margin": "PnL & Margins",
+    "trades": "Suggested Trades",
+    "decision": "QUBO Clearing",
+    "end": "End of the Day",
 }
 
 st.set_page_config(page_title="Clearing Dashboard", layout="wide")
@@ -83,6 +83,24 @@ def _market_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
         row = {"day": day, "z_t": z_t}
         for i in range(r_t.shape[0]):
             row[f"inst_{i + 1}"] = float(r_t[i])
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("day")
+
+
+def _pnl_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for rec in records:
+        if rec.get("phase") != "market":
+            continue
+        day = int(rec.get("day", -1))
+        pnl = _to_numpy(rec.get("pnl"))
+        if pnl is None:
+            continue
+        row = {"day": day}
+        for i in range(pnl.shape[0]):
+            row[f"cl_{i + 1}"] = float(pnl[i])
         rows.append(row)
     if not rows:
         return pd.DataFrame()
@@ -314,6 +332,15 @@ def main() -> None:
         .cell-val { font-weight: 600; font-size: 12px; }
         .cell-note { font-size: 10px; }
         .section-label { font-weight: 700; margin-bottom: 6px; }
+        div[data-testid="stVerticalBlock"]:has(#sticky-header-marker) {
+            position: sticky;
+            top: 0;
+            z-index: 999;
+            background: var(--background-color);
+            padding-top: 6px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--secondary-background-color);
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -344,39 +371,42 @@ def main() -> None:
     max_assets = int(st.sidebar.number_input("Max instruments", min_value=1, value=12, step=1))
     max_scenarios = int(st.sidebar.number_input("Max scenarios", min_value=1, value=8, step=1))
 
-    day_row = st.columns([0.6, 3.4])
-    with day_row[0]:
-        st.markdown("**Day:**")
-    with day_row[1]:
-        day = st.slider(
-            "Day",
-            min_value=min(days),
-            max_value=max(days),
-            value=min(days),
-            step=1,
-            label_visibility="collapsed",
-        )
+    header_container = st.container()
+    with header_container:
+        st.markdown("<div id='sticky-header-marker'></div>", unsafe_allow_html=True)
+        day_row = st.columns([0.6, 3.4])
+        with day_row[0]:
+            st.markdown("**Day:**")
+        with day_row[1]:
+            day = st.slider(
+                "Day",
+                min_value=min(days),
+                max_value=max(days),
+                value=min(days),
+                step=1,
+                label_visibility="collapsed",
+            )
 
-    phases_for_day = [p for p in PHASE_ORDER if p in by_day.get(day, {})]
-    if not phases_for_day:
-        st.warning("No records for selected day.")
-        st.stop()
-    default_phase = "margin" if "margin" in phases_for_day else phases_for_day[0]
-    phase_label_map = [PHASE_LABELS.get(p, p) for p in phases_for_day]
-    label_to_phase = dict(zip(phase_label_map, phases_for_day))
-    phase_row = st.columns([0.6, 3.4])
-    with phase_row[0]:
-        st.markdown("**Phase:**")
-    with phase_row[1]:
-        phase_label = st.radio(
-            "Phase",
-            options=phase_label_map,
-            index=phase_label_map.index(PHASE_LABELS.get(default_phase, default_phase)),
-            horizontal=True,
-            label_visibility="collapsed",
-        )
+        phases_for_day = [p for p in PHASE_ORDER if p in by_day.get(day, {})]
+        if not phases_for_day:
+            st.warning("No records for selected day.")
+            st.stop()
+        default_phase = "margin" if "margin" in phases_for_day else phases_for_day[0]
+        phase_label_map = [PHASE_LABELS.get(p, p) for p in phases_for_day]
+        label_to_phase = dict(zip(phase_label_map, phases_for_day))
+        phase_row = st.columns([0.6, 3.4])
+        with phase_row[0]:
+            st.markdown("**Phase:**")
+        with phase_row[1]:
+            phase_label = st.radio(
+                "Phase",
+                options=phase_label_map,
+                index=phase_label_map.index(PHASE_LABELS.get(default_phase, default_phase)),
+                horizontal=True,
+                label_visibility="collapsed",
+            )
 
-    phase = label_to_phase[phase_label]
+        phase = label_to_phase[phase_label]
 
     rec = by_day[day][phase]
 
@@ -421,8 +451,27 @@ def main() -> None:
     if alive is None and W is not None:
         alive = np.ones(W.shape[0], dtype=bool)
 
-    if z_t is not None:
-        st.caption(f"Market state z_t: {z_t}")
+    market_state_names = {0: "Calm", 1: "Volatile", 2: "Crisis"}
+    with header_container:
+        market_row = st.columns([1.6, 3.4])
+        with market_row[0]:
+            if z_t is not None:
+                state_name = market_state_names.get(int(z_t), "State")
+                state_color = {0: "#22c55e", 1: "#eab308", 2: "#ef4444"}.get(int(z_t), "#111827")
+                st.markdown(
+                    (
+                        f"<div style='font-size:20px;font-weight:600;color:#ffffff;'>"
+                        f"Market state: <span style='color:{state_color};'>{state_name} ({z_t})</span>"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+        with market_row[1]:
+            market_df = _market_dataframe(records)
+            if not market_df.empty:
+                market_df = market_df[market_df["day"] <= day]
+                if not market_df.empty:
+                    st.line_chart(market_df.set_index("day")[["z_t"]], height=120)
 
     row_labels_clients = []
     client_count = None
@@ -588,6 +637,13 @@ def main() -> None:
             )
 
     show_scenarios = phase in {"margin", "trades", "decision"}
+    var_inst = None
+    es_inst = None
+    if Rs is not None:
+        try:
+            var_inst, es_inst = _compute_var_es(Rs, alpha=0.99)
+        except Exception:
+            var_inst, es_inst = None, None
 
     with bottom_cols[1]:
         if show_scenarios:
@@ -616,8 +672,7 @@ def main() -> None:
                 )
 
     with bottom_cols[2]:
-        if show_scenarios and Rs is not None:
-            var_inst, es_inst = _compute_var_es(Rs, alpha=0.99)
+        if show_scenarios and var_inst is not None and es_inst is not None:
             inst_matrix = np.vstack([var_inst, es_inst]).T
             st.markdown(
                 _matrix_table_html(
@@ -635,45 +690,6 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
-    with st.expander("Scenario distributions", expanded=False):
-        if show_scenarios:
-            if Rs is None:
-                st.caption("Scenarios not available.")
-            else:
-                hist_cols = st.columns(2)
-                inst_labels = [f"inst_{i + 1}" for i in range(Rs.shape[1])]
-                with hist_cols[0]:
-                    inst_choice = st.selectbox("Instrument", inst_labels, index=0, key="inst_hist")
-                    idx = inst_labels.index(inst_choice)
-                    series = Rs[:, idx]
-                    fig, ax = plt.subplots(figsize=(3.6, 2.4))
-                    ax.hist(series, bins=12, color="#38bdf8", edgecolor="#1e3a8a")
-                    ax.set_title(f"{inst_choice} returns")
-                    ax.set_xlabel("Return")
-                    ax.set_ylabel("Count")
-                    fig.tight_layout()
-                    st.pyplot(fig)
-                with hist_cols[1]:
-                    if P is not None and row_labels_clients:
-                        cl_labels = row_labels_clients
-                        cl_choice = st.selectbox("Client", cl_labels, index=0, key="client_hist")
-                        cl_idx = cl_labels.index(cl_choice)
-                        losses = -(Rs @ P[cl_idx])
-                        fig2, ax2 = plt.subplots(figsize=(3.6, 2.4))
-                        ax2.hist(losses, bins=12, color="#94a3b8", edgecolor="#334155")
-                        ax2.set_title(f"{cl_choice} loss")
-                        ax2.set_xlabel("Loss")
-                        ax2.set_ylabel("Count")
-                        if var_cur is not None and cl_idx < len(var_cur):
-                            ax2.axvline(var_cur[cl_idx], color="#ef4444", linestyle="--", linewidth=1)
-                            ax2.text(var_cur[cl_idx], ax2.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
-                        fig2.tight_layout()
-                        st.pyplot(fig2)
-                    else:
-                        st.caption("Client loss histogram not available.")
-        else:
-            st.caption("Scenario views are available in Pre-Trade, Trades, and Decision phases.")
-
     if phase == "decision":
         qubo_delta = _to_numpy(rec.get("deltaM"))
         qubo_x = _to_numpy(rec.get("x"))
@@ -686,7 +702,7 @@ def main() -> None:
 
         st.markdown("**QUBO summary**")
         qubo_rows = []
-        qubo_rows.append({"label": "Σ ΔM_i x_i", "value": _format_val(sum_delta, 2) if sum_delta is not None else "n/a"})
+        qubo_rows.append({"label": "Sum deltaM_i x_i", "value": _format_val(sum_delta, 2) if sum_delta is not None else "n/a"})
         qubo_rows.append({"label": "Budget B", "value": _format_val(float(budget), 2) if budget is not None else "n/a"})
         qubo_rows.append({"label": "Penalty", "value": _format_val(float(penalty), 2) if penalty is not None else "n/a"})
         qubo_rows.append({"label": "Energy", "value": _format_val(float(energy), 2) if energy is not None else "n/a"})
@@ -695,15 +711,98 @@ def main() -> None:
         qubo_df = pd.DataFrame(qubo_rows)
         st.dataframe(qubo_df, use_container_width=True, hide_index=True)
 
-    with st.expander("Returns over days", expanded=False):
+    with st.expander("Instrument view", expanded=False):
         market_df = _market_dataframe(records)
         if not market_df.empty:
             market_df = market_df[market_df["day"] <= day]
-            if not market_df.empty:
-                st.line_chart(market_df.set_index("day")[[c for c in market_df.columns if c.startswith("inst_")]])
-                st.line_chart(market_df.set_index("day")[["z_t"]])
+        inst_cols = [c for c in market_df.columns if c.startswith("inst_")] if not market_df.empty else []
+        if not inst_cols and Rs is not None:
+            inst_cols = [f"inst_{i + 1}" for i in range(Rs.shape[1])]
+
+        if not inst_cols:
+            st.caption("Instrument data not available.")
         else:
-            st.info("No market phase records available.")
+            inst_choice = st.selectbox("Instrument", inst_cols, index=0, key="instrument_view")
+            view_cols = st.columns(2)
+            with view_cols[0]:
+                if not market_df.empty and inst_choice in market_df.columns:
+                    fig, ax = plt.subplots(figsize=(4.4, 2.6))
+                    ax.plot(market_df["day"], market_df[inst_choice], color="#f59e0b", marker="o", linewidth=1.5)
+                    ax.set_title(f"{inst_choice} returns (to day {day})")
+                    ax.set_xlabel("day")
+                    ax.set_ylabel("return")
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                else:
+                    st.caption("Return history not available.")
+            with view_cols[1]:
+                if show_scenarios and Rs is not None:
+                    try:
+                        idx = int(inst_choice.split("_")[1]) - 1
+                    except Exception:
+                        idx = inst_cols.index(inst_choice) if inst_choice in inst_cols else 0
+                    series = Rs[:, idx]
+                    fig2, ax2 = plt.subplots(figsize=(4.4, 2.6))
+                    ax2.hist(series, bins=12, color="#f59e0b", edgecolor="#92400e")
+                    ax2.set_title(f"{inst_choice} scenario returns")
+                    ax2.set_xlabel("return")
+                    ax2.set_ylabel("count")
+                    if var_inst is not None and idx < len(var_inst):
+                        ax2.axvline(-var_inst[idx], color="#ef4444", linestyle="--", linewidth=1.2)
+                        ax2.text(-var_inst[idx], ax2.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
+                    fig2.tight_layout()
+                    st.pyplot(fig2)
+                else:
+                    st.caption("Scenario distribution available in PnL & Margins, Suggested Trades, and QUBO Clearing phases.")
+
+    with st.expander("Client view", expanded=False):
+        pnl_df = _pnl_dataframe(records)
+        if not pnl_df.empty:
+            pnl_df = pnl_df[pnl_df["day"] <= day]
+        if row_labels_clients:
+            cl_choice = st.selectbox("Client", row_labels_clients, index=0, key="client_view")
+        else:
+            cl_choice = None
+
+        client_cols = st.columns(2)
+        with client_cols[0]:
+            if cl_choice is None or pnl_df.empty or cl_choice not in pnl_df.columns:
+                st.caption("PnL history not available.")
+            else:
+                fig3, ax3 = plt.subplots(figsize=(4.4, 2.6))
+                ax3.plot(pnl_df["day"], pnl_df[cl_choice], color="#22c55e", marker="o", linewidth=1.5)
+                ax3.set_title(f"{cl_choice} PnL (to day {day})")
+                ax3.set_xlabel("day")
+                ax3.set_ylabel("pnl")
+                fig3.tight_layout()
+                st.pyplot(fig3)
+
+        with client_cols[1]:
+            if show_scenarios and Rs is not None and P is not None and cl_choice is not None:
+                try:
+                    cl_idx = int(cl_choice.split("_")[1]) - 1
+                except Exception:
+                    cl_idx = row_labels_clients.index(cl_choice) if cl_choice in row_labels_clients else 0
+                losses = -(Rs @ P[cl_idx])
+                fig4, ax4 = plt.subplots(figsize=(4.4, 2.6))
+                ax4.hist(losses, bins=12, color="#94a3b8", edgecolor="#334155")
+                ax4.set_title(f"{cl_choice} portfolio loss")
+                ax4.set_xlabel("loss")
+                ax4.set_ylabel("count")
+                var_line = None
+                if phase == "margin" and var_cur is not None:
+                    var_line = var_cur
+                elif phase in {"trades", "decision"} and var_tent is not None:
+                    var_line = var_tent
+                elif var_cur is not None:
+                    var_line = var_cur
+                if var_line is not None and cl_idx < len(var_line):
+                    ax4.axvline(var_line[cl_idx], color="#ef4444", linestyle="--", linewidth=1.2)
+                    ax4.text(var_line[cl_idx], ax4.get_ylim()[1] * 0.9, "VaR", color="#ef4444", fontsize=8)
+                fig4.tight_layout()
+                st.pyplot(fig4)
+            else:
+                st.caption("Scenario risk available in PnL & Margins, Suggested Trades, and QUBO Clearing phases.")
 
 
 if __name__ == "__main__":
