@@ -103,7 +103,7 @@ def simulate_day(
         device=str(device),
     )
 
-    M_req_cur = margin_es(P, R_scenarios, alpha=sim_params.alpha)
+    M_req_cur, var_cur = margin_es(P, R_scenarios, alpha=sim_params.alpha, return_var=True)
     default_now = alive & (W_after_pnl < M_req_cur)
     alive_new = alive & (~default_now)
 
@@ -129,13 +129,14 @@ def simulate_day(
             r_t=r_t,
             pnl=pnl,
             M_req_cur=M_req_cur,
+            var_cur=var_cur,
             R_scenarios=(R_scenarios if log_scenarios else None),
         )
 
     DeltaP = propose_trades(P_liq, r_t, trade_params, alive=alive_new, generator=g_trade)
     P_tent = P_liq + DeltaP
 
-    M_req_tent = margin_es(P_tent, R_scenarios, alpha=sim_params.alpha)
+    M_req_tent, var_tent = margin_es(P_tent, R_scenarios, alpha=sim_params.alpha, return_var=True)
     deltaM = M_req_tent - M_req_cur
 
     if logger is not None:
@@ -150,6 +151,8 @@ def simulate_day(
             r_t=r_t,
             M_req_cur=M_req_cur,
             M_req_tent=M_req_tent,
+            var_cur=var_cur,
+            var_tent=var_tent,
             deltaM=deltaM,
             DeltaP=DeltaP,
             R_scenarios=(R_scenarios if log_scenarios else None),
@@ -196,6 +199,8 @@ def simulate_day(
             lambda_budget=sim_params.lambda_budget,
             eta_risk=sim_params.eta_risk,
             utility_weight=sim_params.utility_weight,
+            var_cur=var_cur,
+            var_tent=var_tent,
             R_scenarios=(R_scenarios if log_scenarios else None),
         )
 

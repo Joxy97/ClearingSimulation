@@ -26,11 +26,15 @@ def build_bqm_accept_clients(
     M = deltaM.numel()
 
     d = deltaM.detach().cpu().to(torch.float64).numpy()
+    d_pos = np.maximum(d, 0.0)
+    d_neg = np.minimum(d, 0.0)
 
     if U is None:
         U_np = np.zeros(M, dtype=np.float64)
     else:
         U_np = U.detach().cpu().to(torch.float64).numpy()
+    # Reward risk-reducing trades (negative deltaM) by default.
+    U_np = U_np + (-d_neg)
 
     if alive is None:
         alive_np = np.ones(M, dtype=bool)
@@ -44,7 +48,7 @@ def build_bqm_accept_clients(
     bqm = dimod.BinaryQuadraticModel.empty(dimod.BINARY)
 
     for i in range(M):
-        lin_i = lam * (d[i] ** 2) + (-2.0 * lam * B) * d[i] + eta * d[i] - U_np[i]
+        lin_i = lam * (d_pos[i] ** 2) + (-2.0 * lam * B) * d_pos[i] + eta * d_pos[i] - U_np[i]
 
         if not alive_np[i]:
             lin_i += big_M
@@ -52,11 +56,11 @@ def build_bqm_accept_clients(
         bqm.add_variable(i, lin_i)
 
     for i in range(M):
-        di = d[i]
+        di = d_pos[i]
         if di == 0.0:
             continue
         for j in range(i + 1, M):
-            q = 2.0 * lam * di * d[j]
+            q = 2.0 * lam * di * d_pos[j]
             if q != 0.0:
                 bqm.add_interaction(i, j, q)
 

@@ -43,6 +43,8 @@ class SimLogger:
         pnl: Optional[torch.Tensor] = None,
         M_req_cur: Optional[torch.Tensor] = None,
         M_req_tent: Optional[torch.Tensor] = None,
+        var_cur: Optional[torch.Tensor] = None,
+        var_tent: Optional[torch.Tensor] = None,
         deltaM: Optional[torch.Tensor] = None,
         DeltaP: Optional[torch.Tensor] = None,
         x: Optional[torch.Tensor] = None,
@@ -68,6 +70,8 @@ class SimLogger:
         rec["pnl"] = _cpu(pnl)
         rec["M_req_cur"] = _cpu(M_req_cur)
         rec["M_req_tent"] = _cpu(M_req_tent)
+        rec["var_cur"] = _cpu(var_cur)
+        rec["var_tent"] = _cpu(var_tent)
         rec["deltaM"] = _cpu(deltaM)
         rec["DeltaP"] = _cpu(DeltaP)
         rec["x"] = _cpu(x)

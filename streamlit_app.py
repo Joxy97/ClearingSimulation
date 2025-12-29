@@ -33,7 +33,7 @@ PHASE_ORDER = ["start", "market", "margin", "trades", "decision", "end"]
 PHASE_LABELS = {
     "start": "Start of the Day",
     "market": "Market Update",
-    "margin": "PnL & Margins",
+    "margin": "Margins",
     "trades": "Suggested Trades",
     "decision": "QUBO Clearing",
     "end": "End of the Day",
@@ -271,7 +271,8 @@ def _portfolio_table_html(
         if abs(dp) <= 1e-12:
             return ""
         sign = "+" if dp >= 0 else ""
-        return f"{sign}{dp:.2f}"
+        color = "#16a34a" if dp >= 0 else "#dc2626"
+        return f"<span style='color:{color};'>{sign}{dp:.2f}</span>"
 
     row_labels = [f"cl_{i + 1}" for i in range(P.shape[0])]
     col_labels = [f"inst_{j + 1}" for j in range(P.shape[1])]
@@ -440,13 +441,25 @@ def main() -> None:
     es_cur = None
     var_tent = None
     es_tent = None
-    if Rs is not None and P is not None:
+    var_cur = _to_numpy(rec.get("var_cur"))
+    var_tent = _to_numpy(rec.get("var_tent"))
+    es_cur = M_req_cur if M_req_cur is not None else None
+    es_tent = M_req_tent if M_req_tent is not None else None
+    if (var_cur is None or (phase in {"trades", "decision"} and var_tent is None)) and Rs is not None and P is not None:
         try:
-            var_cur, es_cur = _portfolio_var_es(P, Rs, alpha=0.99)
+            var_cur_fallback, es_cur_fallback = _portfolio_var_es(P, Rs, alpha=0.99)
+            if var_cur is None:
+                var_cur = var_cur_fallback
+            if es_cur is None:
+                es_cur = es_cur_fallback
             if phase in {"trades", "decision"} and DeltaP is not None:
-                var_tent, es_tent = _portfolio_var_es(P + DeltaP, Rs, alpha=0.99)
+                var_tent_fallback, es_tent_fallback = _portfolio_var_es(P + DeltaP, Rs, alpha=0.99)
+                if var_tent is None:
+                    var_tent = var_tent_fallback
+                if es_tent is None:
+                    es_tent = es_tent_fallback
         except Exception:
-            var_cur, es_cur, var_tent, es_tent = None, None, None, None
+            var_cur, es_cur, var_tent, es_tent = var_cur, es_cur, var_tent, es_tent
 
     if alive is None and W is not None:
         alive = np.ones(W.shape[0], dtype=bool)
@@ -493,7 +506,7 @@ def main() -> None:
 
     top_cols = st.columns([3.2, 4, 2.4])
     with top_cols[0]:
-        stats_cols = ["Alive", "W", "C", "M", "PnL"]
+        stats_cols = ["Alive", "W", "C"]
         stats_data = []
         if alive is None:
             stats_data.append(np.full((client_count or 0,), np.nan))
@@ -507,17 +520,24 @@ def main() -> None:
             stats_data.append(np.full((client_count or 0,), np.nan))
         else:
             stats_data.append(C)
-        if M_req_cur is not None:
-            stats_data.append(M_req_cur)
-        elif M_req_tent is not None:
-            stats_data.append(M_req_tent)
-        else:
-            stats_data.append(np.full((client_count or 0,), np.nan))
-        if pnl is None:
-            stats_data.append(np.full((client_count or 0,), np.nan))
-        else:
-            stats_data.append(pnl)
-        if phase == "trades":
+
+        if phase in {"margin", "trades", "decision"}:
+            stats_cols.append("M")
+            if M_req_cur is not None:
+                stats_data.append(M_req_cur)
+            elif M_req_tent is not None:
+                stats_data.append(M_req_tent)
+            else:
+                stats_data.append(np.full((client_count or 0,), np.nan))
+
+        if phase == "market":
+            stats_cols.append("PnL")
+            if pnl is None:
+                stats_data.append(np.full((client_count or 0,), np.nan))
+            else:
+                stats_data.append(pnl)
+
+        if phase in {"trades", "decision"}:
             stats_cols.append("DeltaM")
             if deltaM is None:
                 stats_data.append(np.full((client_count or 0,), np.nan))

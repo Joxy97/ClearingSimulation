@@ -13,8 +13,10 @@ if REPO_ROOT not in sys.path:
 from boltzmann import RBM  # noqa: E402
 
 from clearing.logger import LogConfig, SimLogger  # noqa: E402
+from clearing.margin import margin_es  # noqa: E402
 from clearing.market import make_default_params, simulate_market  # noqa: E402
 from clearing.quantization import fit_return_quantizer  # noqa: E402
+from clearing.sampler import sample_scenarios_from_float  # noqa: E402
 from clearing.simulation import SimDayParams, simulate_day  # noqa: E402
 from clearing.trading import TradeParams  # noqa: E402
 
@@ -96,8 +98,13 @@ def main() -> None:
         fit_T=args.quantizer_fit_T,
     )
 
-    P = torch.zeros((args.M, args.N), device=device, dtype=dtype)
-    W = torch.full((args.M,), 1_000_000.0, device=device, dtype=dtype)
+    g_init = torch.Generator(device=device).manual_seed(args.seed_market + 999)
+
+    P_raw = torch.rand((args.M, args.N), device=device, dtype=dtype, generator=g_init) * 2000.0 - 1000.0
+    mask = (torch.rand((args.M, args.N), device=device, generator=g_init) < 0.30).to(dtype=dtype)
+    P = P_raw * mask
+
+    W = torch.normal(mean=20000.0, std=5000.0, size=(args.M,), device=device, dtype=dtype, generator=g_init)
     C = torch.zeros((args.M,), device=device, dtype=dtype)
     alive = torch.ones((args.M,), device=device, dtype=torch.bool)
 
@@ -123,6 +130,20 @@ def main() -> None:
         sa_num_sweeps=2000,
         post_full_margin_daily=True,
     )
+
+    R_init = sample_scenarios_from_float(
+        model=model,
+        config=cfg,
+        quantizer=quantizer,
+        z_t=z_prev,
+        r_prev_float=r_prev,
+        num_samples=args.Omega,
+        burn_in=args.burn_in,
+        thin=args.thin,
+        device=device,
+    )
+    M_req_init = margin_es(P, R_init, alpha=sim_params.alpha)
+    C = M_req_init * 1.10
 
     logger = SimLogger(
         LogConfig(
