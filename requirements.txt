@@ -1,0 +1,8 @@
+torch
+numpy
+pandas
+matplotlib
+dimod
+dwave-neal
+streamlit
+git+https://github.com/Joxy97/BoltzmaNN9.git

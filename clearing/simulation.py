@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Literal
+
+import torch
+
+from .logger import SimLogger
+from .margin import margin_es
+from .market import MarketParams, generate_day
+from .qubo import build_bqm_accept_clients, solve_bqm
+from .sampler import sample_scenarios_from_float
+from .trading import TradeParams, propose_trades
+
+
+@dataclass
+class SimDayParams:
+    alpha: float = 0.99
+    budget_B: float = 0.0
+    lambda_budget: float = 10.0
+    eta_risk: float = 0.0
+    utility_weight: float = 0.0
+    qubo_solver: Literal["sa", "hybrid", "leap_hybrid"] = "sa"
+    sa_num_reads: int = 200
+    sa_num_sweeps: int = 2000
+    leap_time_limit: Optional[float] = None
+    post_full_margin_daily: bool = True
+
+
+@torch.no_grad()
+def simulate_day(
+    *,
+    P: torch.Tensor,
+    W: torch.Tensor,
+    C: torch.Tensor,
+    alive: torch.Tensor,
+    z_prev: int,
+    r_prev: torch.Tensor,
+    market_params: MarketParams,
+    rbm_model,
+    rbm_config: Dict[str, Any],
+    quantizer,
+    trade_params: TradeParams,
+    sim_params: SimDayParams,
+    g_market: Optional[torch.Generator] = None,
+    g_trade: Optional[torch.Generator] = None,
+    num_scenarios: int = 2000,
+    burn_in: int = 500,
+    thin: int = 10,
+    device: Optional[str] = None,
+    day: Optional[int] = None,
+    logger: Optional[SimLogger] = None,
+    log_scenarios: bool = False,
+    return_scenarios: bool = False,
+) -> Dict[str, Any]:
+    """
+    One full day step.
+    """
+    if P.ndim != 2:
+        raise ValueError("P must be [M,N]")
+    M, N = P.shape
+
+    if W.shape != (M,):
+        raise ValueError("W must be [M]")
+    if C.shape != (M,):
+        raise ValueError("C must be [M]")
+    if alive.shape != (M,):
+        raise ValueError("alive must be [M]")
+    if r_prev.shape != (N,):
+        raise ValueError("r_prev must be [N]")
+
+    if device is None:
+        device = P.device
+
+    P = P.to(device=device)
+    W = W.to(device=device)
+    C = C.to(device=device)
+    alive = alive.to(device=device, dtype=torch.bool)
+    r_prev = r_prev.to(device=device)
+
+    d = 0 if day is None else int(day)
+
+    if logger is not None:
+        logger.log(day=d, phase="start", P=P, W=W, C=C, alive=alive, z_t=int(z_prev), r_t=r_prev)
+
+    z_t, r_t, _d_t = generate_day(z_prev, r_prev, market_params, generator=g_market)
+
+    pnl = (P * r_t[None, :]).sum(dim=1)
+    W_after_pnl = W + pnl
+
+    if logger is not None:
+        logger.log(day=d, phase="market", P=P, W=W_after_pnl, C=C, alive=alive, z_t=int(z_t), r_t=r_t, pnl=pnl)
+
+    R_scenarios = sample_scenarios_from_float(
+        model=rbm_model,
+        config=rbm_config,
+        quantizer=quantizer,
+        z_t=z_t,
+        r_prev_float=r_t,
+        num_samples=num_scenarios,
+        burn_in=burn_in,
+        thin=thin,
+        device=str(device),
+    )
+
+    M_req_cur = margin_es(P, R_scenarios, alpha=sim_params.alpha)
+    default_now = alive & (W_after_pnl < M_req_cur)
+    alive_new = alive & (~default_now)
+
+    if sim_params.post_full_margin_daily:
+        C_new = torch.where(alive_new, torch.minimum(W_after_pnl, M_req_cur), C)
+    else:
+        need = alive_new & (C < M_req_cur)
+        topup = torch.minimum(W_after_pnl - C, M_req_cur - C).clamp(min=0.0)
+        C_new = torch.where(need, C + topup, C)
+
+    P_liq = torch.where(alive_new[:, None], P, torch.zeros_like(P))
+    W_new = torch.where(alive_new, W_after_pnl, torch.zeros_like(W_after_pnl))
+
+    if logger is not None:
+        logger.log(
+            day=d,
+            phase="margin",
+            P=P_liq,
+            W=W_new,
+            C=C_new,
+            alive=alive_new,
+            z_t=int(z_t),
+            r_t=r_t,
+            pnl=pnl,
+            M_req_cur=M_req_cur,
+            R_scenarios=(R_scenarios if log_scenarios else None),
+        )
+
+    DeltaP = propose_trades(P_liq, r_t, trade_params, alive=alive_new, generator=g_trade)
+    P_tent = P_liq + DeltaP
+
+    M_req_tent = margin_es(P_tent, R_scenarios, alpha=sim_params.alpha)
+    deltaM = M_req_tent - M_req_cur
+
+    if logger is not None:
+        logger.log(
+            day=d,
+            phase="trades",
+            P=P_liq,
+            W=W_new,
+            C=C_new,
+            alive=alive_new,
+            z_t=int(z_t),
+            r_t=r_t,
+            M_req_cur=M_req_cur,
+            M_req_tent=M_req_tent,
+            deltaM=deltaM,
+            DeltaP=DeltaP,
+        )
+
+    if sim_params.utility_weight != 0.0:
+        U = sim_params.utility_weight * DeltaP.abs().sum(dim=1)
+    else:
+        U = None
+
+    bqm = build_bqm_accept_clients(
+        deltaM=deltaM,
+        B=sim_params.budget_B,
+        U=U,
+        alive=alive_new,
+        lambda_budget=sim_params.lambda_budget,
+        eta_risk=sim_params.eta_risk,
+    )
+
+    x, energy = solve_bqm(
+        bqm,
+        method=sim_params.qubo_solver,
+        num_reads=sim_params.sa_num_reads,
+        num_sweeps=sim_params.sa_num_sweeps,
+        time_limit=sim_params.leap_time_limit,
+        out_device=str(device),
+    )
+
+    if logger is not None:
+        logger.log(
+            day=d,
+            phase="decision",
+            P=P_liq,
+            W=W_new,
+            C=C_new,
+            alive=alive_new,
+            z_t=int(z_t),
+            r_t=r_t,
+            deltaM=deltaM,
+            DeltaP=DeltaP,
+            x=x,
+            qubo_energy=energy,
+        )
+
+    x_f = x.to(dtype=P.dtype)
+    P_next = P_liq + x_f[:, None] * DeltaP
+
+    M_req_next = margin_es(P_next, R_scenarios, alpha=sim_params.alpha)
+    if sim_params.post_full_margin_daily:
+        C_next = torch.where(alive_new, torch.minimum(W_new, M_req_next), C_new)
+    else:
+        C_next = C_new
+
+    z_prev_next = int(z_t)
+    r_prev_next = r_t
+
+    if logger is not None:
+        logger.log(
+            day=d,
+            phase="end",
+            P=P_next,
+            W=W_new,
+            C=C_next,
+            alive=alive_new,
+            z_t=int(z_t),
+            r_t=r_t,
+            pnl=pnl,
+            M_req_cur=M_req_next,
+            x=x,
+            qubo_energy=energy,
+        )
+
+    out = {
+        "P": P_next,
+        "W": W_new,
+        "C": C_next,
+        "alive": alive_new,
+        "z_prev": z_prev_next,
+        "r_prev": r_prev_next,
+        "z_t": int(z_t),
+        "r_t": r_t,
+        "pnl": pnl,
+        "M_req_cur": M_req_cur,
+        "M_req_tent": M_req_tent,
+        "deltaM": deltaM,
+        "default_now": default_now,
+        "x": x,
+        "qubo_energy": float(energy),
+    }
+    if return_scenarios:
+        out["R_scenarios"] = R_scenarios
+    return out
