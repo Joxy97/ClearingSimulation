@@ -122,7 +122,7 @@ def solve_bqm(
                 time_limit = float(env_limit)
             except ValueError as e:
                 raise ValueError(f"Invalid CLSIM_TIME_LIMIT value: {env_limit}") from e
-        ss = sampler.sample(bqm, time_limit=float(time_limit), label=label)
+        ss = sampler.sample(bqm, time_limit=5, label=label)
 
     else:
         raise ValueError(f"Unknown method {method}")
