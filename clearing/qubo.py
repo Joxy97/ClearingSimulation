@@ -83,6 +83,7 @@ def solve_bqm(
     time_limit: Optional[float] = None,
 
     out_device: str = "cpu",
+    label: Optional[str] = None,
 ) -> Tuple[torch.Tensor, float]:
     """
     Returns:
@@ -113,7 +114,15 @@ def solve_bqm(
             raise ImportError("Install Leap solver: pip install dwave-system") from e
 
         sampler = LeapHybridSampler(token=token)
-        ss = sampler.sample(bqm, time_limit=5.0)
+        if label is None:
+            label = os.getenv("CLSIM_LABEL") or "ClSim"
+        if time_limit is None:
+            env_limit = os.getenv("CLSIM_TIME_LIMIT", "5")
+            try:
+                time_limit = float(env_limit)
+            except ValueError as e:
+                raise ValueError(f"Invalid CLSIM_TIME_LIMIT value: {env_limit}") from e
+        ss = sampler.sample(bqm, time_limit=float(time_limit), label=label)
 
     else:
         raise ValueError(f"Unknown method {method}")

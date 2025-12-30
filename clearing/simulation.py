@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import time
 from typing import Any, Dict, Optional, Literal
 
@@ -230,6 +231,11 @@ def simulate_day(
     qubo_num_vars = len(bqm.variables)
     qubo_num_interactions = len(bqm.quadratic)
     t0 = time.perf_counter()
+    label = None
+    if sim_params.qubo_solver == "hybrid":
+        sim_id = os.getenv("CLSIM_RUN")
+        if sim_id:
+            label = f"ClSim{sim_id}_day{d}"
     x, energy = solve_bqm(
         bqm,
         method=sim_params.qubo_solver,
@@ -237,6 +243,7 @@ def simulate_day(
         num_sweeps=sim_params.sa_num_sweeps,
         time_limit=sim_params.leap_time_limit,
         out_device=str(device),
+        label=label,
     )
     solve_time_s = time.perf_counter() - t0
 
@@ -316,6 +323,9 @@ def simulate_day(
         "default_now": default_now,
         "x": x,
         "qubo_energy": float(energy),
+        "qubo_num_vars": qubo_num_vars,
+        "qubo_num_interactions": qubo_num_interactions,
+        "qubo_solve_time_s": float(solve_time_s),
     }
     if return_scenarios:
         out["R_scenarios"] = R_scenarios

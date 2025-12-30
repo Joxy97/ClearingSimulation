@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 import torch
 
@@ -24,11 +25,11 @@ from clearing.trading import TradeParams  # noqa: E402
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run clearing simulation with RBM scenarios.")
     parser.add_argument("--M", type=int, default=100, help="Number of clients.")
-    parser.add_argument("--T", type=int, default=50, help="Number of simulation days.")
+    parser.add_argument("--T", type=int, default=10, help="Number of simulation days.")
     parser.add_argument("--N", type=int, default=500, help="Number of instruments. Change requires new RBM.")
     parser.add_argument("--Omega", type=int, default=1000, help="Scenarios per day.")
     parser.add_argument("--model-run", type=str, default="models/model", help="RBM run folder.")
-    parser.add_argument("--quantizer", type=str, default="data/quantizer.pt", help="Quantizer path (optional).")
+    parser.add_argument("--quantizer", type=str, default="data/quantizer", help="Quantizer path (optional).")
     parser.add_argument("--quantizer-fit-T", type=int, default=10000, help="Days for fitting quantizer if not found.")
     parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, or cuda.")
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float64"], help="Tensor dtype.")
@@ -198,6 +199,7 @@ def main() -> None:
     C = M_req_init * (1.0 + init_collateral_buffer)
     F_init = M_req_init * init_liquidity_buffer
     W = C + F_init
+    W_start_total = float(W.sum().item())
 
     logger = SimLogger(
         LogConfig(
@@ -208,6 +210,10 @@ def main() -> None:
         )
     )
 
+    qubo_sizes: list[float] = []
+    qubo_times: list[float] = []
+    qubo_energies: list[float] = []
+    sim_t0 = time.perf_counter()
     for t in range(args.T):
         out = simulate_day(
             P=P,
@@ -244,19 +250,49 @@ def main() -> None:
         pnl = out["pnl"]
         M_req_cur = out["M_req_cur"]
         deltaM = out["deltaM"]
+        qubo_energy = out.get("qubo_energy")
+        qubo_num_vars = out.get("qubo_num_vars")
+        qubo_num_interactions = out.get("qubo_num_interactions")
+        qubo_solve_time_s = out.get("qubo_solve_time_s")
+        if qubo_energy is not None:
+            qubo_energies.append(float(qubo_energy))
+        if qubo_num_vars is not None and qubo_num_interactions is not None:
+            qubo_sizes.append(float(qubo_num_vars) + float(qubo_num_interactions))
+        elif qubo_num_vars is not None:
+            qubo_sizes.append(float(qubo_num_vars))
+        if qubo_solve_time_s is not None:
+            qubo_times.append(float(qubo_solve_time_s))
 
         n_alive = int(alive.sum().item())
         n_def = int(default_now.sum().item())
         acc_rate = float((x[alive].float().mean().item()) if n_alive > 0 else 0.0)
 
         print(
-            f"Day {t:02d} | state z={out['z_t']} | alive={n_alive:02d} | defaulted={n_def:02d} | "
+            f"Day {t + 1:02d}/{args.T:02d} | state z={out['z_t']} | alive={n_alive:02d} | defaulted={n_def:02d} | "
             f"acc_rate={acc_rate:.2f} | "
             f"mean_pnl={_safe_mean(pnl, alive):.2f} | "
             f"mean_margin={_safe_mean(M_req_cur, alive):.2f} | "
             f"mean_deltaM={_safe_mean(deltaM, alive):.2f} | "
             f"qubo_E={out['qubo_energy']:.2f}"
         )
+
+    sim_time_s = time.perf_counter() - sim_t0
+    W_end_total = float(W.sum().item())
+    clients_gain = W_end_total - W_start_total
+    total_dl = float(default_loss.sum().item())
+    total_defaulted = int((~alive).sum().item())
+    mean_qubo_size = sum(qubo_sizes) / len(qubo_sizes) if qubo_sizes else 0.0
+    mean_qubo_time = sum(qubo_times) / len(qubo_times) if qubo_times else 0.0
+    mean_qubo_energy = sum(qubo_energies) / len(qubo_energies) if qubo_energies else 0.0
+
+    print("Simulation summary")
+    print(f"Total DL: {total_dl:.2f}")
+    print(f"Clients' gain: {clients_gain:.2f}")
+    print(f"Total defaulted clients: {total_defaulted}")
+    print(f"Mean QUBO size (vars + interactions): {mean_qubo_size:.2f}")
+    print(f"Mean QUBO time (s): {mean_qubo_time:.4f}")
+    print(f"Mean QUBO energy: {mean_qubo_energy:.2f}")
+    print(f"Total simulation time (s): {sim_time_s:.2f}")
 
     if args.log_path:
         out_dir = os.path.dirname(args.log_path)
