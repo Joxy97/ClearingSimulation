@@ -23,8 +23,8 @@ from clearing.trading import TradeParams  # noqa: E402
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run clearing simulation with RBM scenarios.")
-    parser.add_argument("--M", type=int, default=1000, help="Number of clients.")
-    parser.add_argument("--T", type=int, default=10, help="Number of simulation days.")
+    parser.add_argument("--M", type=int, default=100, help="Number of clients.")
+    parser.add_argument("--T", type=int, default=50, help="Number of simulation days.")
     parser.add_argument("--N", type=int, default=500, help="Number of instruments. Change requires new RBM.")
     parser.add_argument("--Omega", type=int, default=1000, help="Scenarios per day.")
     parser.add_argument("--model-run", type=str, default="models/model", help="RBM run folder.")
@@ -32,11 +32,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quantizer-fit-T", type=int, default=10000, help="Days for fitting quantizer if not found.")
     parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, or cuda.")
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float64"], help="Tensor dtype.")
-    parser.add_argument("--seed-market", type=int, default=123, help="Market RNG seed.")
-    parser.add_argument("--seed-trade", type=int, default=456, help="Trade RNG seed.")
+    parser.add_argument("--seed-market", type=int, default=42, help="Market RNG seed.")
+    parser.add_argument("--seed-trade", type=int, default=42, help="Trade RNG seed.")
     parser.add_argument("--burn-in", type=int, default=200, help="RBM burn-in.")
     parser.add_argument("--thin", type=int, default=5, help="RBM thinning.")
-    parser.add_argument("--qubo-solver", type=str, default="sa", choices=["sa", "hybrid", "leap_hybrid"], help="QUBO solver.")
+    parser.add_argument("--qubo-solver", type=str, default="sa", choices=["sa", "hybrid"], help="QUBO solver.")
     parser.add_argument("--budget", type=float, default=0.0, help="Risk budget B.")
     parser.add_argument("--lambda-budget", type=float, default=10.0, help="Budget penalty lambda.")
     parser.add_argument("--eta-risk", type=float, default=0.0, help="Risk penalty eta.")
@@ -46,6 +46,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-max-abs", type=float, default=100.0, help="Max absolute trade size.")
     parser.add_argument("--init-collateral-buffer", type=float, default=0.10, help="Initial collateral buffer as fraction of ES.")
     parser.add_argument("--init-liquidity-buffer", type=float, default=0.20, help="Initial liquidity buffer as fraction of ES.")
+    parser.add_argument("--init-position-scale", type=float, default=1000.0, help="Initial absolute position scale.")
+    parser.add_argument("--init-position-density", type=float, default=0.30, help="Initial position density (0..1).")
+    parser.add_argument("--init-position-long-only", action="store_true", help="Use long-only initial positions.")
+    parser.add_argument("--stress", action="store_true", help="Enable stress-test preset.")
+    parser.add_argument("--start-state", type=int, default=None, help="Initial market state z_0 (default: 0, or 2 with --stress).")
+    parser.add_argument("--stress-level", type=float, default=3.0, help="Stress multiplier for market volatility/jumps and position scale.")
+    parser.add_argument("--stress-day", type=int, default=0, help="Day index to apply return shock in stress mode.")
+    parser.add_argument("--stress-return-scale", type=float, default=3.0, help="Return scale on the stress day.")
+    parser.add_argument("--stress-return-shift", type=float, default=-0.05, help="Return shift on the stress day.")
     parser.add_argument("--log-path", type=str, default="simulations/logs/run_log.pt", help="Output path for log tensor.")
     return parser.parse_args()
 
@@ -86,6 +95,21 @@ def main() -> None:
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
 
     market_params = make_default_params(N=args.N, S=3, F=2, device=device, dtype=dtype)
+    stress_on = bool(args.stress)
+    stress_level = float(args.stress_level) if stress_on else 1.0
+    if stress_on:
+        if stress_level < 1.0:
+            stress_level = 1.0
+        market_params.sigma_f = market_params.sigma_f * stress_level
+        market_params.sigma_e = market_params.sigma_e * stress_level
+        if market_params.jump_sigma is not None:
+            market_params.jump_sigma = market_params.jump_sigma * stress_level
+        if market_params.jump_p is not None:
+            market_params.jump_p = torch.clamp(market_params.jump_p * stress_level, max=0.5)
+        bias = min(0.8, 0.15 * (stress_level - 1.0))
+        if bias > 0.0:
+            crisis = torch.tensor([0.05, 0.15, 0.80], device=device, dtype=dtype)
+            market_params.Pz = (1.0 - bias) * market_params.Pz + bias * crisis[None, :]
 
     g_market = torch.Generator(device=device).manual_seed(args.seed_market)
     g_trade = torch.Generator(device=device).manual_seed(args.seed_trade)
@@ -102,8 +126,19 @@ def main() -> None:
 
     g_init = torch.Generator(device=device).manual_seed(args.seed_market + 999)
 
-    P_raw = torch.rand((args.M, args.N), device=device, dtype=dtype, generator=g_init) * 2000.0 - 1000.0
-    mask = (torch.rand((args.M, args.N), device=device, generator=g_init) < 0.30).to(dtype=dtype)
+    init_position_scale = float(args.init_position_scale)
+    init_position_density = float(args.init_position_density)
+    if stress_on:
+        init_position_scale = init_position_scale * stress_level
+        init_position_density = min(1.0, init_position_density * stress_level)
+    if not (0.0 <= init_position_density <= 1.0):
+        raise ValueError("init-position-density must be in [0, 1].")
+
+    if args.init_position_long_only:
+        P_raw = torch.rand((args.M, args.N), device=device, dtype=dtype, generator=g_init) * init_position_scale
+    else:
+        P_raw = torch.rand((args.M, args.N), device=device, dtype=dtype, generator=g_init) * (2.0 * init_position_scale) - init_position_scale
+    mask = (torch.rand((args.M, args.N), device=device, generator=g_init) < init_position_density).to(dtype=dtype)
     P = P_raw * mask
 
     C = torch.zeros((args.M,), device=device, dtype=dtype)
@@ -111,7 +146,17 @@ def main() -> None:
     default_loss = torch.zeros((args.M,), device=device, dtype=dtype)
     alive = torch.ones((args.M,), device=device, dtype=torch.bool)
 
-    z_prev = 0
+    init_collateral_buffer = float(args.init_collateral_buffer)
+    init_liquidity_buffer = float(args.init_liquidity_buffer)
+    if stress_on:
+        init_collateral_buffer = min(init_collateral_buffer, 0.02)
+        init_liquidity_buffer = min(init_liquidity_buffer, 0.05)
+
+    if args.start_state is None:
+        z_prev = 2 if stress_on else 0
+    else:
+        z_prev = int(args.start_state)
+    start_state = z_prev
     r_prev = torch.zeros((args.N,), device=device, dtype=dtype)
 
     trade_params = TradeParams(
@@ -132,6 +177,9 @@ def main() -> None:
         sa_num_reads=100,
         sa_num_sweeps=2000,
         post_full_margin_daily=True,
+        stress_day=(args.stress_day if stress_on else None),
+        stress_return_scale=(args.stress_return_scale if stress_on else 1.0),
+        stress_return_shift=(args.stress_return_shift if stress_on else 0.0),
     )
 
     R_init = sample_scenarios_from_float(
@@ -147,8 +195,8 @@ def main() -> None:
     )
     M_req_init = margin_es(P, R_init, alpha=sim_params.alpha)
     M_req_init = torch.clamp(M_req_init, min=0.0)
-    C = M_req_init * (1.0 + float(args.init_collateral_buffer))
-    F_init = M_req_init * float(args.init_liquidity_buffer)
+    C = M_req_init * (1.0 + init_collateral_buffer)
+    F_init = M_req_init * init_liquidity_buffer
     W = C + F_init
 
     logger = SimLogger(
@@ -236,8 +284,17 @@ def main() -> None:
             "trade_base_scale": float(args.trade_base_scale),
             "trade_noise_scale": float(args.trade_noise_scale),
             "trade_max_abs": float(args.trade_max_abs),
-            "init_collateral_buffer": float(args.init_collateral_buffer),
-            "init_liquidity_buffer": float(args.init_liquidity_buffer),
+            "init_collateral_buffer": float(init_collateral_buffer),
+            "init_liquidity_buffer": float(init_liquidity_buffer),
+            "init_position_scale": float(init_position_scale),
+            "init_position_density": float(init_position_density),
+            "init_position_long_only": bool(args.init_position_long_only),
+            "start_state": int(start_state),
+            "stress": bool(stress_on),
+            "stress_level": float(stress_level),
+            "stress_day": None if not stress_on else int(args.stress_day),
+            "stress_return_scale": float(sim_params.stress_return_scale),
+            "stress_return_shift": float(sim_params.stress_return_shift),
             "trade_momentum_weight": float(trade_params.momentum_weight),
             "trade_gamma_exposure": float(trade_params.gamma_exposure),
             "p_trade_when_zero": float(trade_params.p_trade_when_zero),

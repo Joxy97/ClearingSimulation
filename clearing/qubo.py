@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Literal, Optional, Tuple
 
 import numpy as np
@@ -73,7 +74,7 @@ def build_bqm_accept_clients(
 def solve_bqm(
     bqm: dimod.BinaryQuadraticModel,
     *,
-    method: Literal["sa", "hybrid", "leap_hybrid"] = "sa",
+    method: Literal["sa", "hybrid"] = "sa",
 
     num_reads: int = 200,
     num_sweeps: int = 2000,
@@ -88,9 +89,6 @@ def solve_bqm(
       x: [M] int64 tensor with 0/1 for variables 0..M-1
       energy: best energy found
     """
-    if method == "leap_hybrid":
-        method = "hybrid"
-
     if method == "sa":
         try:
             from dwave.samplers import SimulatedAnnealingSampler
@@ -106,16 +104,16 @@ def solve_bqm(
         )
 
     elif method == "hybrid":
+        token = os.getenv("DWAVE_API_KEY")
+        if not token:
+            raise ValueError("DWAVE_API_KEY environment variable is required for the hybrid solver.")
         try:
             from dwave.system import LeapHybridSampler
         except ImportError as e:
             raise ImportError("Install Leap solver: pip install dwave-system") from e
 
-        sampler = LeapHybridSampler()
-        kwargs = {}
-        if time_limit is not None:
-            kwargs["time_limit"] = float(time_limit)
-        ss = sampler.sample(bqm, **kwargs)
+        sampler = LeapHybridSampler(token=token)
+        ss = sampler.sample(bqm, time_limit=5.0)
 
     else:
         raise ValueError(f"Unknown method {method}")

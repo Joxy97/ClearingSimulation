@@ -21,11 +21,14 @@ class SimDayParams:
     lambda_budget: float = 10.0
     eta_risk: float = 0.0
     utility_weight: float = 0.0
-    qubo_solver: Literal["sa", "hybrid", "leap_hybrid"] = "sa"
+    qubo_solver: Literal["sa", "hybrid"] = "sa"
     sa_num_reads: int = 200
     sa_num_sweeps: int = 2000
     leap_time_limit: Optional[float] = None
     post_full_margin_daily: bool = True
+    stress_day: Optional[int] = None
+    stress_return_scale: float = 1.0
+    stress_return_shift: float = 0.0
 
 
 @torch.no_grad()
@@ -91,6 +94,8 @@ def simulate_day(
         logger.log(day=d, phase="start", P=P, W=W, C=C, alive=alive, z_t=int(z_prev), r_t=r_prev, default_loss=default_loss)
 
     z_t, r_t, _d_t = generate_day(z_prev, r_prev, market_params, generator=g_market)
+    if sim_params.stress_day is not None and d == int(sim_params.stress_day):
+        r_t = r_t * float(sim_params.stress_return_scale) + float(sim_params.stress_return_shift)
 
     pnl = (P * r_t[None, :]).sum(dim=1)
 

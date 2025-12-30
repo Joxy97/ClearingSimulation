@@ -1,2 +1,2 @@
 *.csv
-simulations/logs/*.pt
+*.pt
