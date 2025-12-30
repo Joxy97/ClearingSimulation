@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from typing import Dict, List
 
 import matplotlib
@@ -21,6 +23,20 @@ SUMMARY_PATTERNS = {
     "mean_qubo_time": re.compile(r"^Mean QUBO time .*:\s+([-+]?\d+(?:\.\d+)?)$"),
     "mean_qubo_energy": re.compile(r"^Mean QUBO energy:\s+([-+]?\d+(?:\.\d+)?)$"),
     "total_sim_time": re.compile(r"^Total simulation time .*:\s+([-+]?\d+(?:\.\d+)?)$"),
+}
+
+BENCH_SETTINGS = {
+    "stress": True,
+    "stress_level": 1.0,
+    "start_state": 0,
+    "init_position_scale": 150,
+    "init_position_density": 0.3,
+    "trade_base_scale": 10,
+    "trade_noise_scale": 2,
+    "trade_max_abs": 100,
+    "stress_day": 3,
+    "stress_return_scale": 10,
+    "stress_return_shift": -0.05,
 }
 
 
@@ -41,31 +57,34 @@ def _parse_summary(output: str) -> Dict[str, float]:
 
 
 def _build_command(seed_market: int, seed_trade: int, M: int, T: int, qubo_solver: str) -> List[str]:
-    return [
+    cmd = [
         sys.executable,
         "-u",
         os.path.join("scripts", "run_simulation.py"),
-        "--stress",
+    ]
+    if BENCH_SETTINGS["stress"]:
+        cmd.append("--stress")
+    cmd += [
         "--stress-level",
-        "1.0",
+        str(BENCH_SETTINGS["stress_level"]),
         "--start-state",
-        "0",
+        str(BENCH_SETTINGS["start_state"]),
         "--init-position-scale",
-        "150",
+        str(BENCH_SETTINGS["init_position_scale"]),
         "--init-position-density",
-        "0.3",
+        str(BENCH_SETTINGS["init_position_density"]),
         "--trade-base-scale",
-        "10",
+        str(BENCH_SETTINGS["trade_base_scale"]),
         "--trade-noise-scale",
-        "2",
+        str(BENCH_SETTINGS["trade_noise_scale"]),
         "--trade-max-abs",
-        "100",
+        str(BENCH_SETTINGS["trade_max_abs"]),
         "--stress-day",
-        "3",
+        str(BENCH_SETTINGS["stress_day"]),
         "--stress-return-scale",
-        "10",
+        str(BENCH_SETTINGS["stress_return_scale"]),
         "--stress-return-shift",
-        "-0.05",
+        str(BENCH_SETTINGS["stress_return_shift"]),
         "--M",
         str(M),
         "--T",
@@ -79,6 +98,7 @@ def _build_command(seed_market: int, seed_trade: int, M: int, T: int, qubo_solve
         "--log-path",
         "",
     ]
+    return cmd
 
 
 def _run_once(run_idx: int, seed_market: int, seed_trade: int, M: int, T: int, qubo_solver: str) -> Dict[str, float]:
@@ -118,13 +138,17 @@ def _run_once(run_idx: int, seed_market: int, seed_trade: int, M: int, T: int, q
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run simulation benchmark and export histogram dashboard.")
     parser.add_argument("--runs", type=int, default=100, help="Number of simulations to run.")
-    parser.add_argument("--output", type=str, default="benchmark_dashboard.png", help="Output PNG path.")
     parser.add_argument("--seed-market", type=int, default=123, help="Base market seed.")
     parser.add_argument("--seed-trade", type=int, default=456, help="Base trade seed.")
     parser.add_argument("--M", type=int, default=1000, help="Number of clients.")
     parser.add_argument("--T", type=int, default=30, help="Number of simulation days.")
     parser.add_argument("--qubo-solver", type=str, default="sa", choices=["sa", "hybrid"], help="QUBO solver.")
     args = parser.parse_args()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_base = f"benchmark_{args.qubo_solver}_{timestamp}"
+    output_png = f"{output_base}.png"
+    output_json = f"{output_base}.json"
 
     totals_dl: List[float] = []
     gains: List[float] = []
@@ -171,8 +195,33 @@ def main() -> None:
 
     fig.suptitle(f"Simulation Benchmark Histograms (n={args.runs})", fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(args.output, dpi=150)
-    print(f"Saved dashboard to {args.output}")
+    fig.savefig(output_png, dpi=150)
+    print(f"Saved dashboard to {output_png}")
+
+    metadata = {
+        "timestamp": timestamp,
+        "output_png": output_png,
+        "output_json": output_json,
+        "runs": args.runs,
+        "seed_market_base": args.seed_market,
+        "seed_trade_base": args.seed_trade,
+        "M": args.M,
+        "T": args.T,
+        "qubo_solver": args.qubo_solver,
+        "benchmark_settings": BENCH_SETTINGS,
+        "metrics": {
+            "total_dl": totals_dl,
+            "clients_gain": gains,
+            "total_defaulted_clients": total_defaulted,
+            "mean_qubo_size": mean_qubo_sizes,
+            "mean_qubo_time_s": mean_qubo_times,
+            "mean_qubo_energy": mean_qubo_energies,
+            "total_sim_time_s": total_sim_times,
+        },
+    }
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved metadata to {output_json}")
 
 
 if __name__ == "__main__":
