@@ -7,6 +7,12 @@ from typing import Any, Dict, Optional, Literal
 
 import torch
 
+from .counterparty import (
+    CounterpartyNetwork,
+    CounterpartyParams,
+    compute_bilateral_exposures,
+    propagate_default_losses,
+)
 from .logger import SimLogger
 from .margin import margin_es
 from .market import MarketParams, generate_day
@@ -48,6 +54,8 @@ def simulate_day(
     quantizer,
     trade_params: TradeParams,
     sim_params: SimDayParams,
+    counterparty_network: Optional[CounterpartyNetwork] = None,
+    counterparty_params: Optional[CounterpartyParams] = None,
     g_market: Optional[torch.Generator] = None,
     g_trade: Optional[torch.Generator] = None,
     num_scenarios: int = 2000,
@@ -106,8 +114,26 @@ def simulate_day(
     W_settle = W + pnl
     F_pre = (W - C) + pnl
     C_after_f = C + torch.minimum(F_pre, torch.zeros_like(F_pre))
-    default_loss_step = (-C_after_f).clamp(min=0.0)
+    default_loss_initial = (-C_after_f).clamp(min=0.0)
     C_after_f = C_after_f.clamp(min=0.0)
+
+    # Counterparty loss propagation with default fund
+    if counterparty_params is not None and counterparty_params.enabled and counterparty_network is not None:
+        exposure_matrix = compute_bilateral_exposures(
+            counterparty_network.contracts, r_t, M, str(device), dtype
+        )
+        counterparty_network.exposure_matrix = exposure_matrix
+
+        default_loss_step, W_settle, C_after_f, df_used = propagate_default_losses(
+            default_loss_initial, exposure_matrix, W_settle, C_after_f,
+            counterparty_network.default_fund_contrib,
+            counterparty_network.total_default_fund,
+            alive, counterparty_params, logger, d, str(device), dtype
+        )
+        counterparty_network.total_default_fund -= df_used
+    else:
+        default_loss_step = default_loss_initial
+
     W_settle = torch.maximum(W_settle, torch.zeros_like(W_settle))
     default_loss = default_loss + default_loss_step
     default_loss_total = float(default_loss.sum().item())
@@ -140,6 +166,14 @@ def simulate_day(
 
     M_req_cur, var_cur = margin_es(P, R_scenarios, alpha=sim_params.alpha, return_var=True)
 
+    # Add CVA margin for counterparty credit risk
+    cva_margin = None
+    if counterparty_params is not None and counterparty_params.enabled and counterparty_params.cva_enabled and counterparty_network is not None:
+        if counterparty_network.exposure_matrix is not None:
+            total_receivables = counterparty_network.exposure_matrix.sum(dim=1)
+            cva_margin = counterparty_params.cva_multiplier * total_receivables.clamp(min=0.0)
+            M_req_cur = M_req_cur + cva_margin
+
     if logger is not None:
         logger.log(
             day=d,
@@ -151,6 +185,9 @@ def simulate_day(
             z_t=int(z_t),
             r_t=r_t,
             M_req_cur=M_req_cur,
+            cva_margin=cva_margin,
+            counterparty_exposure=counterparty_network.exposure_matrix if counterparty_network is not None else None,
+            default_fund_balance=counterparty_network.total_default_fund if counterparty_network is not None else None,
             var_cur=var_cur,
             default_loss=default_loss,
             default_loss_total=default_loss_total,
@@ -326,6 +363,7 @@ def simulate_day(
         "qubo_num_vars": qubo_num_vars,
         "qubo_num_interactions": qubo_num_interactions,
         "qubo_solve_time_s": float(solve_time_s),
+        "counterparty_network": counterparty_network,
     }
     if return_scenarios:
         out["R_scenarios"] = R_scenarios

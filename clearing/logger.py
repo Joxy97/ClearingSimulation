@@ -22,6 +22,7 @@ class LogConfig:
     scenarios_max_assets: int = 50
     store_scenario_stats: bool = True
     scenario_stats_quantiles: tuple[float, ...] = (0.01, 0.05, 0.5, 0.95, 0.99)
+    store_counterparty: bool = False
 
 
 @dataclass
@@ -60,6 +61,10 @@ class SimLogger:
         lambda_budget: Optional[float] = None,
         eta_risk: Optional[float] = None,
         utility_weight: Optional[float] = None,
+        counterparty_exposure: Optional[torch.Tensor] = None,
+        default_fund_balance: Optional[float] = None,
+        cva_margin: Optional[torch.Tensor] = None,
+        contagion_round: Optional[int] = None,
     ) -> None:
         if phase not in self.cfg.log_phases:
             return
@@ -101,6 +106,15 @@ class SimLogger:
             rec["eta_risk"] = float(eta_risk)
         if utility_weight is not None:
             rec["utility_weight"] = float(utility_weight)
+
+        if counterparty_exposure is not None and self.cfg.store_counterparty:
+            rec["counterparty_exposure"] = _cpu(counterparty_exposure)
+        if default_fund_balance is not None:
+            rec["default_fund_balance"] = float(default_fund_balance)
+        if cva_margin is not None:
+            rec["cva_margin"] = _cpu(cva_margin)
+        if contagion_round is not None:
+            rec["contagion_round"] = int(contagion_round)
 
         if R_scenarios is not None and self.cfg.store_scenario_stats:
             Rs = R_scenarios.detach()
