@@ -120,7 +120,7 @@ def simulate_day(
     # Counterparty loss propagation with default fund
     if counterparty_params is not None and counterparty_params.enabled and counterparty_network is not None:
         exposure_matrix = compute_bilateral_exposures(
-            counterparty_network.contracts, r_t, M, str(device), dtype
+            counterparty_network.contracts, r_t, M, str(device), P.dtype
         )
         counterparty_network.exposure_matrix = exposure_matrix
 
@@ -128,7 +128,7 @@ def simulate_day(
             default_loss_initial, exposure_matrix, W_settle, C_after_f,
             counterparty_network.default_fund_contrib,
             counterparty_network.total_default_fund,
-            alive, counterparty_params, logger, d, str(device), dtype
+            alive, counterparty_params, logger, d, str(device), P.dtype
         )
         counterparty_network.total_default_fund -= df_used
     else:

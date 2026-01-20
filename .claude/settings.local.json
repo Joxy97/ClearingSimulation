@@ -4,7 +4,19 @@
       "Bash(dir:*)",
       "Bash(python -m pytest unit_tests/test_counterparty.py -v)",
       "Bash(python -m unittest:*)",
-      "Bash(python test_counterparty_integration.py:*)"
+      "Bash(python test_counterparty_integration.py:*)",
+      "Bash(python scripts/run_simulation.py:*)",
+      "Bash(python3:*)",
+      "Bash(conda env list:*)",
+      "Bash(pip3 list:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import torch; q = torch.load\\(''data/quantizer.pt''\\); print\\(''K_bits:'', q.K\\); print\\(''Quantizer info:'', q\\)\")",
+      "Bash(python -c \"\nimport sys\nsys.path.insert\\(0, ''.''\\)\nimport torch\ntorch.serialization.add_safe_globals\\([''clearing.quantization.ReturnQuantizer'']\\)\nfrom clearing.quantization import ReturnQuantizer\nq = torch.load\\(''data/quantizer.pt'', weights_only=False\\)\nprint\\(''K_bits:'', q.K if hasattr\\(q, ''K''\\) else ''unknown''\\)\nprint\\(''Quantizer type:'', type\\(q\\)\\)\nprint\\(''Attributes:'', dir\\(q\\)\\)\n\")",
+      "Bash(python -c:*)",
+      "Bash(tee:*)",
+      "Bash(python analyze_ccp_test.py:*)",
+      "Bash(streamlit run:*)"
     ]
   }
 }
