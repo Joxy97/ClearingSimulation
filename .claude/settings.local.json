@@ -4,7 +4,8 @@
       "Bash(dir:*)",
       "Bash(python -m pytest unit_tests/test_counterparty.py -v)",
       "Bash(python -m unittest:*)",
-      "Bash(python test_counterparty_integration.py:*)"
+      "Bash(python test_counterparty_integration.py:*)",
+      "Bash(python:*)"
     ]
   }
 }

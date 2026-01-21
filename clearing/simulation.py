@@ -90,6 +90,8 @@ def simulate_day(
     if device is None:
         device = P.device
 
+    dtype = P.dtype
+
     P = P.to(device=device)
     W = W.to(device=device)
     C = C.to(device=device)

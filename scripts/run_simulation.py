@@ -74,6 +74,20 @@ def _safe_mean(v: torch.Tensor, mask: torch.Tensor | None = None) -> float:
     return float(vv.mean().item()) if vv.numel() > 0 else 0.0
 
 
+def _load_rbm_from_folder(run_folder: str, device: str):
+    """Load RBM model and config from a run folder."""
+    model_path = os.path.join(run_folder, "model.pt")
+    checkpoint = torch.load(model_path, map_location=device)
+
+    cfg = checkpoint["config"]
+    model = RBM(cfg)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    return model, cfg
+
+
 def _load_or_fit_quantizer(
     *,
     quantizer_path: str,
@@ -122,7 +136,7 @@ def main() -> None:
     g_market = torch.Generator(device=device).manual_seed(args.seed_market)
     g_trade = torch.Generator(device=device).manual_seed(args.seed_trade)
 
-    model, cfg = RBM.from_run_folder(args.model_run, device=device)
+    model, cfg = _load_rbm_from_folder(args.model_run, device=device)
 
     quantizer = _load_or_fit_quantizer(
         quantizer_path=args.quantizer,
