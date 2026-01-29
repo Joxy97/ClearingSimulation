@@ -1,0 +1,255 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Clearing Simulation: Single-Run Technical Report and Onboarding Guide}
+\author{Project Clearing Simulation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Purpose and Scope}
+This report explains how a single simulation run works in the clearing project,
+focusing on the logic, algorithms, and daily processing steps. It references the
+codebase locations that implement each component. The second half provides
+user guidelines for onboarding new team members, including a step-by-step daily
+timeline of the simulation phases.
+
+\section{High-Level Architecture}
+\subsection{Core Modules}
+\begin{itemize}[leftmargin=*]
+  \item \texttt{scripts/run\_simulation.py}: CLI entry point. Loads RBM model and quantizer,
+  initializes portfolios, sets simulation parameters, calls \texttt{simulate\_day}, prints
+  per-day progress and end-of-run summary.
+  \item \texttt{clearing/simulation.py}: Main daily loop in \texttt{simulate\_day}. Handles
+  settlement, margining, defaulting, trading proposal, QUBO construction, and acceptance.
+  \item \texttt{clearing/market.py}: Market state transitions and return generation.
+  \item \texttt{clearing/sampler.py}: Scenario sampling via RBM with clamped visible units.
+  \item \texttt{clearing/quantization.py}: Return quantization and bit encoding for the RBM.
+  \item \texttt{clearing/margin.py}: Expected Shortfall (ES) and VaR computation.
+  \item \texttt{clearing/trading.py}: Trade proposal model.
+  \item \texttt{clearing/qubo.py}: Builds the BQM for trade acceptance and solves it.
+  \item \texttt{clearing/logger.py}: Logging of daily phases and optional scenario stats.
+\end{itemize}
+
+\subsection{Key Data Shapes}
+Throughout the simulation:
+\begin{itemize}[leftmargin=*]
+  \item $P \in \mathbb{R}^{M \times N}$: client portfolios (M clients, N instruments).
+  \item $W \in \mathbb{R}^M$: total wealth per client.
+  \item $C \in \mathbb{R}^M$: collateral per client.
+  \item $r_t \in \mathbb{R}^N$: daily market returns.
+  \item $R \in \mathbb{R}^{\Omega \times N}$: scenario return matrix.
+  \item \texttt{alive} $\in \{\texttt{True}, \texttt{False}\}^M$: whether client remains active.
+\end{itemize}
+These shape checks are enforced in \texttt{clearing/simulation.py::simulate\_day}.
+
+\section{Market Model}
+The market model uses a Markov chain with three regimes (calm, volatile, crisis)
+and factor-driven returns. Implemented in \texttt{clearing/market.py}.
+
+\subsection{State Transition}
+State $z_t$ is sampled using a row of transition matrix $P_z$ (see
+\texttt{make\_default\_params}). The default transition matrix biases toward staying in the
+current regime.
+
+\subsection{Return Generation}
+Given $z_t$, factor returns $f_t$ and idiosyncratic noise $\epsilon_t$ are sampled:
+\[
+f_t \sim \mathcal{N}(0, \sigma_f[z_t]), \quad
+\epsilon_t \sim \mathcal{N}(0, \sigma_e[z_t])
+\]
+Returns are:
+\[
+r_t = B f_t + \epsilon_t
+\]
+If \texttt{rho} is nonzero, returns mix with $r_{t-1}$ using
+$r_t = \rho r_{t-1} + (1-\rho) r_{\text{raw}}$.
+Optional jumps are applied with probability \texttt{jump\_p[z\_t]} using
+\texttt{jump\_sigma} and \texttt{jump\_mu}. See \texttt{clearing/market.py::generate\_day}.
+
+\section{Scenario Generation via RBM}
+Scenario sampling is conditional on the current regime $z_t$ and previous returns
+$r_{t-1}$. Implemented in \texttt{clearing/sampler.py::sample\_scenarios\_from\_float}.
+
+\subsection{Quantization}
+Returns are quantized per instrument into $K$ bits using quantile-based bounds
+\texttt{ReturnQuantizer} in \texttt{clearing/quantization.py}.
+The pipeline:
+\begin{enumerate}[leftmargin=*]
+  \item Compute per-instrument quantile bounds \texttt{fit\_return\_quantizer}.
+  \item Encode $r_{t-1}$ into $K$-bit vectors (\texttt{encode\_returns}).
+  \item Clamp visible units for $z_t$ (one-hot) and $r_{t-1}$ in the RBM.
+  \item Sample the RBM with Gibbs sampling (\texttt{RBM.sample\_clamped}).
+  \item Decode sampled bits into scenario returns (\texttt{decode\_returns}).
+\end{enumerate}
+The RBM configuration (visible block sizes) is loaded from the model run folder
+in \texttt{scripts/run\_simulation.py}.
+
+\section{Margin Model (ES/VaR)}
+Margins are computed from scenario losses using Expected Shortfall (ES):
+\begin{align*}
+\text{PnL} &= R P^T \\
+\text{Loss} &= -\text{PnL}
+\end{align*}
+Losses are sorted per client, and ES is the mean of the worst $(1-\alpha)$ tail.
+VaR is the loss at quantile $\alpha$. Implemented in
+\texttt{clearing/margin.py::margin\_es}.
+
+\section{Daily Simulation Algorithm}
+The daily loop is in \texttt{clearing/simulation.py::simulate\_day}. The phases below
+match the logger phases used by the Streamlit dashboard.
+
+\subsection{Phase 1: Start of Day}
+Inputs: $P$, $W$, $C$, \texttt{alive}, previous regime $z_{t-1}$ and returns $r_{t-1}$.
+Logged as phase \texttt{start}.
+
+\subsection{Phase 2: Market Move}
+Generate market regime and returns with \texttt{generate\_day}. Compute PnL:
+\[
+\text{PnL}_i = \sum_{j=1}^N P_{ij} \cdot r_{t,j}
+\]
+Logged as phase \texttt{market\_move}.
+If stress is enabled, returns are adjusted on a chosen stress day:
+\[
+r_t \leftarrow r_t \cdot \texttt{stress\_return\_scale} + \texttt{stress\_return\_shift}
+\]
+See \texttt{SimDayParams} in \texttt{clearing/simulation.py}.
+
+\subsection{Phase 3: Settlement}
+Wealth and collateral are updated:
+\begin{align*}
+W_{\text{settle}} &= W + \text{PnL} \\
+F_{\text{pre}} &= (W - C) + \text{PnL} \\
+C_{\text{after}} &= C + \min(F_{\text{pre}}, 0)
+\end{align*}
+Defaults are accounted for as:
+\[
+\text{default\_loss\_step} = \max(-C_{\text{after}}, 0)
+\]
+Collateral and wealth are floored at zero. Total default loss accumulates in
+\texttt{default\_loss}. Logged as phase \texttt{settlement}.
+
+\subsection{Phase 4: Margining}
+Scenario returns $R$ are sampled from the RBM and used to compute ES and VaR.
+Required margin $M_{\text{req}}$ is the ES per client. Logged as phase \texttt{margin}.
+
+\subsection{Phase 5: Default and Liquidity}
+Clients must top up collateral to $M_{\text{req}}$ using available funds:
+\begin{align*}
+F_{\text{avail}} &= \max(W_{\text{settle}} - C_{\text{after}}, 0) \\
+\text{need} &= \max(M_{\text{req}} - C_{\text{after}}, 0)
+\end{align*}
+If $F_{\text{avail}} < \text{need}$, the client defaults. Defaulted clients are
+removed from trading, and their portfolios are liquidated to zero
+(\texttt{P\_liq}). Logged as phase \texttt{default}.
+
+\subsection{Phase 6: Trade Proposal}
+Proposed trades are generated for active clients in
+\texttt{clearing/trading.py::propose\_trades}:
+\begin{align*}
+\mu &= \texttt{base\_scale} \cdot \texttt{momentum\_weight} \cdot r_t \cdot (|P|+1)^{\gamma} \\
+\sigma &= \texttt{noise\_scale} \cdot (\sqrt{|P|} + 1) \\
+\Delta P &= \mu + \sigma \cdot \epsilon,\quad \epsilon \sim \mathcal{N}(0, I)
+\end{align*}
+Zero positions are traded with probability \texttt{p\_trade\_when\_zero}, optionally
+with a separate noise term \texttt{zero\_trade\_std}. Trades are clipped by
+\texttt{max\_abs\_trade}. Logged as phase \texttt{trades}.
+
+\subsection{Phase 7: QUBO Clearing}
+Tentative margins are computed for $P_{\text{tent}} = P_{\text{liq}} + \Delta P$.
+Margin change is:
+\[
+\Delta M = M_{\text{req,tent}} - M_{\text{req,cur}}
+\]
+A binary decision vector $x$ selects which clients' trades to accept.
+The BQM is built in \texttt{clearing/qubo.py::build\_bqm\_accept\_clients}:
+\begin{itemize}[leftmargin=*]
+  \item Penalizes positive $\Delta M$ to keep total risk below budget $B$.
+  \item Rewards negative $\Delta M$ (risk-reducing trades).
+  \item Optional utility term is based on trade size
+  (\texttt{utility\_weight} times $|\Delta P|$).
+\end{itemize}
+The solver is either simulated annealing (\texttt{sa}) or hybrid (\texttt{hybrid}),
+implemented in \texttt{clearing/qubo.py::solve\_bqm}. Hybrid uses
+\texttt{DWAVE\_API\_KEY} and supports labels such as \texttt{ClSim\{run\}\_day\{d\}}
+via the \texttt{label} parameter. Logged as phase \texttt{decision}.
+
+\subsection{Phase 8: End of Day}
+Accepted trades update portfolios:
+\[
+P_{\text{next}} = P_{\text{liq}} + x \odot \Delta P
+\]
+Margins are recomputed for logging. Outputs include updated $P$, $W$, $C$,
+\texttt{alive}, default loss totals, QUBO stats, and updated state $z_t$, $r_t$.
+Logged as phase \texttt{end}.
+
+\section{Initialization and Run Loop}
+\texttt{scripts/run\_simulation.py} performs the following:
+\begin{itemize}[leftmargin=*]
+  \item Loads an RBM run folder and optional quantizer. If the quantizer is missing,
+  it is fitted from a fresh market simulation.
+  \item Initializes portfolios $P$ with random values and a density mask.
+  \item Computes initial margin and sets collateral and liquidity buffers.
+  \item Runs \texttt{simulate\_day} for $T$ days, prints day-by-day progress.
+  \item Prints a final summary: Total DL, Clients' gain, total defaults, mean QUBO
+  size/time/energy, and total simulation time.
+\end{itemize}
+Stress-test presets in \texttt{run\_simulation.py} can amplify volatility and jump
+sizes, increase initial position sizes, reduce buffers, and trigger a stress day.
+
+\section{User Guidelines for New Members}
+\subsection{Typical Workflow}
+\begin{enumerate}[leftmargin=*]
+  \item Install dependencies from \texttt{requirements.txt}.
+  \item (Optional) Generate a dataset and quantizer:
+  \texttt{python scripts/generate\_data.py --T 10000 --out-csv data/data.csv --out-quantizer data/quantizer.pt}
+  \item Run a single simulation:
+  \texttt{python scripts/run\_simulation.py --model-run models/model\_mini --quantizer data/quantizer.pt}
+  \item View results in the Streamlit dashboard:
+  \texttt{streamlit run streamlit\_app.py} and open the generated \texttt{run\_log.pt}.
+\end{enumerate}
+
+\subsection{Daily Timeline (What Happens Each Day)}
+Use this checklist when reading logs or onboarding:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Start:} Capture $P$, $W$, $C$, and the previous market state.
+  \item \textbf{Market move:} Sample $z_t$ and $r_t$, compute PnL.
+  \item \textbf{Settlement:} Update wealth/collateral and accumulate default loss.
+  \item \textbf{Margins:} Sample scenarios and compute ES/VaR.
+  \item \textbf{Default:} Check funding shortfalls and deactivate defaulted clients.
+  \item \textbf{Trades:} Propose trades based on momentum and exposure.
+  \item \textbf{Decision:} Solve the QUBO to accept or reject trades.
+  \item \textbf{End:} Apply accepted trades and log final state for the day.
+\end{enumerate}
+
+\subsection{Interpreting End-of-Run Summary}
+At the end of a simulation, the console prints:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Total DL:} Sum of default losses over all days.
+  \item \textbf{Clients' gain:} Total wealth change from start to end.
+  \item \textbf{Total defaulted clients:} Count of clients that could not meet margin.
+  \item \textbf{Mean QUBO size/time/energy:} Average solver statistics per day.
+  \item \textbf{Total simulation time:} Wall-clock runtime for the full run.
+\end{itemize}
+
+\subsection{Benchmarking}
+The benchmarking tool \texttt{benchmark.py} runs multiple simulations with fixed
+settings, then exports histograms and metadata. The output files are named
+\texttt{benchmark\_\{solver\}\_\{date\_time\}.png} and
+\texttt{benchmark\_\{solver\}\_\{date\_time\}.json}.
+
+\section{Practical Notes}
+\begin{itemize}[leftmargin=*]
+  \item Scenario generation assumes RBM visible blocks match $N \cdot K$.
+  If you change $N$ or quantization bits $K$, you must retrain or regenerate
+  the RBM and quantizer.
+  \item The parameter \texttt{post\_full\_margin\_daily} is currently implemented
+  but uses the same logic in both branches; it exists for future extensions.
+  \item Hybrid QUBO requires \texttt{DWAVE\_API\_KEY} to be set in the environment.
+\end{itemize}
+
+\end{document}

@@ -1,0 +1,269 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Benchmarking Simulated Annealing vs Hybrid QUBO Solvers in the Clearing Simulation}
+\author{Project Technical Report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the single-run simulation mechanics and benchmarks two QUBO
+solvers---Simulated Annealing (SA) and Hybrid---using 30 short simulations each.
+We summarize model assumptions, daily calculations, and benchmarking constraints,
+then analyze solver outcomes with caution due to the limited sample size and short
+horizon. Results are derived from JSON logs in \texttt{benchmark\_results/} and
+visualized using the corresponding PNG histograms.
+\end{abstract}
+
+\section{Introduction}
+The clearing simulation models a multi-client, multi-asset clearinghouse where
+daily market moves generate profits and losses, margins are computed via Expected
+Shortfall, and a QUBO decision accepts or rejects proposed trades under a risk
+budget. This report has two goals: (1) provide a scientific description of the
+single-day algorithm and its assumptions; (2) compare SA and Hybrid solvers on a
+fixed benchmark configuration.
+
+\section{Simulation assumptions and configuration}
+\subsection{Market and return generation}
+Market dynamics use a three-regime Markov chain (calm, volatile, crisis), factor
+returns, idiosyncratic noise, and optional jumps. These assumptions are encoded in
+\texttt{clearing/market.py}:
+\begin{itemize}[leftmargin=*]
+  \item Transition matrix $P_z$ defines regime persistence.
+  \item Returns are $r_t = B f_t + \epsilon_t$ with regime-dependent
+  volatilities $\sigma_f[z_t]$ and $\sigma_e[z_t]$.
+  \item Optional jumps add tail events with probability \texttt{jump\_p}.
+\end{itemize}
+
+\subsection{Scenario generation (RBM + quantization)}
+Risk scenarios are sampled via a Restricted Boltzmann Machine (RBM) conditioned on
+current regime $z_t$ and previous returns $r_{t-1}$ (see
+\texttt{clearing/sampler.py}). Returns are quantized to $K$ bits per asset using
+quantile bounds (see \texttt{clearing/quantization.py}). The sampler clamps
+$(z_t, r_{t-1})$ and samples future returns $r_t$, producing scenario matrix
+$R \in \mathbb{R}^{\Omega \times N}$.
+
+\subsection{Portfolio, wealth, and collateral}
+Each client holds a portfolio $P \in \mathbb{R}^{M \times N}$, wealth $W \in
+\mathbb{R}^M$, and collateral $C \in \mathbb{R}^M$. Portfolios are initialized in
+\texttt{scripts/run\_simulation.py} with a density mask and scaled random values.
+
+\section{Daily simulation steps and calculations}
+The daily loop is implemented in \texttt{clearing/simulation.py::simulate\_day}.
+Phases correspond to the logger in \texttt{clearing/logger.py}.
+
+\subsection{1. Market move}
+Generate $z_t$ and $r_t$ (see \texttt{clearing/market.py::generate\_day}). PnL is
+\[
+\text{PnL}_i = \sum_{j=1}^N P_{ij} r_{t,j}
+\]
+Stress testing may apply an additional linear shock
+$r_t \leftarrow r_t \cdot \texttt{stress\_return\_scale} + \texttt{stress\_return\_shift}$.
+
+\subsection{2. Settlement and default loss}
+Wealth and collateral are updated as:
+\begin{align*}
+W_{\text{settle}} &= W + \text{PnL} \\
+F_{\text{pre}} &= (W - C) + \text{PnL} \\
+C_{\text{after}} &= C + \min(F_{\text{pre}}, 0)
+\end{align*}
+Default loss accumulates if collateral becomes negative:
+\[
+\text{DL}_{\text{step}} = \max(-C_{\text{after}}, 0)
+\]
+See \texttt{clearing/simulation.py} for the settlement logic.
+
+\subsection{3. Margining (Expected Shortfall)}
+Scenario returns are sampled from the RBM and used to compute Expected Shortfall:
+\begin{align*}
+\text{PnL} &= R P^T \\
+\text{Loss} &= -\text{PnL}
+\end{align*}
+ES is the mean of the worst $(1-\alpha)$ tail; VaR is the $\alpha$-quantile loss.
+Implementation: \texttt{clearing/margin.py::margin\_es}.
+
+\subsection{4. Default check and collateral top-up}
+Clients must post collateral to meet the margin requirement. If available funds
+are insufficient, the client defaults and is removed from trading:
+\begin{align*}
+F_{\text{avail}} &= \max(W_{\text{settle}} - C_{\text{after}}, 0) \\
+\text{need} &= \max(M_{\text{req}} - C_{\text{after}}, 0)
+\end{align*}
+Defaulted clients are marked inactive and their portfolios are set to zero for
+trading (\texttt{P\_liq}).
+
+\subsection{5. Trade proposal}
+Trades are generated using a momentum signal and exposure scaling in
+\texttt{clearing/trading.py}:
+\begin{align*}
+\mu &= \texttt{base\_scale} \cdot \texttt{momentum\_weight} \cdot r_t \cdot (|P|+1)^{\gamma} \\
+\sigma &= \texttt{noise\_scale} \cdot (\sqrt{|P|}+1) \\
+\Delta P &= \mu + \sigma \cdot \epsilon,\quad \epsilon \sim \mathcal{N}(0,I)
+\end{align*}
+Zero positions are traded with probability \texttt{p\_trade\_when\_zero}. Trades are
+clipped by \texttt{max\_abs\_trade}.
+
+\subsection{6. QUBO clearing decision}
+Tentative margins are computed for $P_{\text{tent}} = P_{\text{liq}} + \Delta P$,
+with $\Delta M = M_{\text{req,tent}} - M_{\text{req,cur}}$. A Binary Quadratic Model
+(BQM) selects clients to accept trades by minimizing a quadratic penalty that
+enforces a risk budget $B$ and rewards risk-reducing trades. Implementation:
+\texttt{clearing/qubo.py::build\_bqm\_accept\_clients}.
+
+Solvers:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{SA}: \texttt{dwave-neal} simulated annealing with
+  \texttt{num\_reads} and \texttt{num\_sweeps} from \texttt{scripts/run\_simulation.py}.
+  \item \textbf{Hybrid}: \texttt{dwave-system} LeapHybridSampler with a fixed
+  time limit (set to 10 seconds in the benchmark harness) and per-call labels
+  \texttt{ClSim\{run\}\_day\{d\}}.
+\end{itemize}
+
+\subsection{7. End of day}
+Accepted trades update portfolios:
+\[
+P_{\text{next}} = P_{\text{liq}} + x \odot \Delta P
+\]
+Daily outputs include updated $P$, $W$, $C$, \texttt{alive}, default loss totals,
+and QUBO statistics.
+
+\section{Benchmark design}
+\subsection{Inputs and settings}
+The benchmark runs are recorded in:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{benchmark\_results/benchmark\_sa\_20251230\_150952.json}
+  \item \texttt{benchmark\_results/benchmark\_hybrid\_20251230\_163041.json}
+\end{itemize}
+Each solver is evaluated over 30 runs with $M=1000$ clients and $T=12$ days. The
+number of assets is the default $N=500$ from \texttt{scripts/run\_simulation.py},
+and the scenario count is the default $\Omega=1000$. Stress settings are fixed:
+\texttt{stress}=True, \texttt{stress\_level}=1.0, \texttt{start\_state}=0,
+\texttt{init\_position\_scale}=150, \texttt{init\_position\_density}=0.3,
+\texttt{trade\_base\_scale}=10, \texttt{trade\_noise\_scale}=2,
+\texttt{trade\_max\_abs}=100, \texttt{stress\_day}=3,
+\texttt{stress\_return\_scale}=10, \texttt{stress\_return\_shift}=-0.05.
+Seeds are incremented per run from base values (see JSON metadata).
+
+\subsection{Metrics}
+Each run records:
+Total DL, Clients' gain (end minus start wealth), total defaulted clients,
+mean QUBO size (variables + interactions), mean QUBO time, mean QUBO energy, and
+total simulation time. Histogram overviews are in:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{benchmark\_results/benchmark\_sa\_20251230\_150952.png}
+  \item \texttt{benchmark\_results/benchmark\_hybrid\_20251230\_163041.png}
+\end{itemize}
+
+\subsection{Benchmarking limits}
+Only 30 runs per solver are available, with a short 12-day horizon. This limits
+statistical power and makes tail events noisy. Hybrid solver times include cloud
+overhead and queue time; the requested time limit is 10 seconds per solve, but
+observed solver time is higher. Results should be interpreted as indicative, not
+conclusive.
+
+\section{Results}
+\subsection{Summary statistics}
+Tables~\ref{tab:sa} and~\ref{tab:hybrid} summarize metrics (mean, median, min, max).
+
+\begin{table}[h]
+\centering
+\caption{Simulated Annealing (30 runs, $M=1000$, $T=12$)}
+\label{tab:sa}
+\begin{tabular}{lrrrr}
+\toprule
+Metric & Mean & Median & Min & Max \\
+\midrule
+Total DL & 4332.45 & 1444.31 & 238.50 & 68991.84 \\
+Clients' gain & 2710.15 & 352.15 & -23264.76 & 79903.50 \\
+Total defaulted clients & 741.23 & 740.50 & 629.00 & 839.00 \\
+Mean QUBO size & 47516.22 & 46588.92 & 35058.58 & 63258.33 \\
+Mean QUBO time (s) & 4.39 & 4.26 & 3.52 & 5.46 \\
+Mean QUBO energy & -332.16 & -337.16 & -455.30 & -206.13 \\
+Total sim time (s) & 83.68 & 83.31 & 73.61 & 98.17 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Hybrid Solver (30 runs, $M=1000$, $T=12$)}
+\label{tab:hybrid}
+\begin{tabular}{lrrrr}
+\toprule
+Metric & Mean & Median & Min & Max \\
+\midrule
+Total DL & 3608.13 & 1623.32 & 233.71 & 44984.77 \\
+Clients' gain & 1851.29 & 2420.04 & -27501.65 & 99894.50 \\
+Total defaulted clients & 742.37 & 744.50 & 645.00 & 852.00 \\
+Mean QUBO size & 47980.41 & 47911.21 & 37466.92 & 60737.75 \\
+Mean QUBO time (s) & 18.15 & 17.50 & 15.50 & 29.37 \\
+Mean QUBO energy & -325.73 & -341.55 & -388.70 & -197.76 \\
+Total sim time (s) & 247.82 & 238.68 & 217.08 & 385.60 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Histogram overview}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{benchmark_results/benchmark_sa_20251230_150952.png}
+\caption{SA histograms for all metrics (30 runs).}
+\label{fig:sa_hist}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{benchmark_results/benchmark_hybrid_20251230_163041.png}
+\caption{Hybrid histograms for all metrics (30 runs).}
+\label{fig:hy_hist}
+\end{figure}
+
+\section{Discussion}
+\subsection{Solver comparison}
+Both solvers yield similar average defaulted-client counts and QUBO sizes, suggesting
+the trade selection problem is of comparable scale across runs. Hybrid exhibits
+substantially higher QUBO time (mean 18.15s vs 4.39s) and total simulation time
+(mean 247.82s vs 83.68s), reflecting solver overhead and longer optimization.
+
+For default loss (DL), Hybrid shows a lower mean but a higher median, while the
+maximum DL is lower than SA (44984.77 vs 68991.84). This pattern may suggest
+reduced extreme-tail events in Hybrid, but the small sample size and short horizon
+make this inference weak. Clients' gain distributions are wide for both solvers,
+with large positive and negative extremes, indicating strong sensitivity to random
+initialization and market paths.
+
+\subsection{High default-loss events}
+DL distributions are highly skewed, with maxima orders of magnitude above medians.
+This indicates occasional severe stress realizations, consistent with the stress
+day at $t=3$ and amplified return scaling. Because only 30 runs are available,
+these high-loss events dominate the mean and should not be interpreted as stable
+tail statistics.
+
+\section{Single-simulation limits}
+Each run is only 12 days long with a fixed stress event, limiting insight into
+long-horizon stability or rare-event frequency. Portfolio initialization is random
+and sparse, and scenario generation depends on RBM sampling and quantizer settings.
+Changing $N$, $K$, or the RBM/quantizer requires retraining to maintain consistency
+between scenario sampling and return dynamics.
+
+\section{Benchmarking limits}
+The benchmark uses a single stress configuration and does not sweep budgets, trade
+intensities, or market parameters. Hybrid solver performance is affected by external
+latency and queue time. The results should be used for qualitative comparison
+only and should not be over-interpreted as statistically robust.
+
+\section{Conclusion}
+In this benchmark, Hybrid is substantially slower but produces broadly similar
+outcomes in default counts and QUBO size, with modest differences in default loss
+statistics and energy. Given the limited sample size and short horizons, a more
+extensive study (larger $T$, more runs, multiple stress profiles) is required
+before drawing strong conclusions about solver quality or tail-risk mitigation.
+
+\end{document}

@@ -473,14 +473,18 @@ def main() -> None:
         with day_row[0]:
             st.markdown("**Day:**")
         with day_row[1]:
-            day = st.slider(
-                "Day",
-                min_value=min(days),
-                max_value=max(days),
-                value=min(days),
-                step=1,
-                label_visibility="collapsed",
-            )
+            if len(days) == 1:
+                st.markdown(f"**{days[0]}**")
+                day = days[0]
+            else:
+                day = st.slider(
+                    "Day",
+                    min_value=min(days),
+                    max_value=max(days),
+                    value=min(days),
+                    step=1,
+                    label_visibility="collapsed",
+                )
 
         phases_for_day = [p for p in PHASE_ORDER if p in by_day.get(day, {})]
         if not phases_for_day:
