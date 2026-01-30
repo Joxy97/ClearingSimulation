@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -74,6 +75,17 @@ def generate_day(
     d_t = torch.cat([state_oh, r_prev, r_t], dim=0)
 
     return z_t, r_t, d_t
+
+
+def generate_day2(days: pd.DataFrame, index_of_current_day: int, num_cols: int) -> torch.Tensor:
+    """
+    Generate next day from DataFrame by taking the rightmost 87 columns
+    and returning the row at index_of_current_day+1.
+    """
+    next_day_index = index_of_current_day + 1
+    next_day_row = days.iloc[next_day_index, - num_cols:]
+
+    return torch.tensor(next_day_row.values, dtype=torch.float32)
 
 
 def make_default_params(N: int = 5, S: int = 3, F: int = 2, device: str = "cuda", dtype: torch.dtype = torch.float32) -> MarketParams:

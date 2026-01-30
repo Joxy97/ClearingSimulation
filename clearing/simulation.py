@@ -9,7 +9,7 @@ import torch
 
 from .logger import SimLogger
 from .margin import margin_es
-from .market import MarketParams, generate_day
+from .market import MarketParams, generate_day2
 from .qubo import build_bqm_accept_clients, solve_bqm
 from .sampler import sample_scenarios_from_float
 from .trading import TradeParams, propose_trades
@@ -40,8 +40,8 @@ def simulate_day(
     C: torch.Tensor,
     default_loss: Optional[torch.Tensor] = None,
     alive: torch.Tensor,
-    z_prev: int,
-    r_prev: torch.Tensor,
+    r_prev: int,
+    num_cols: int,
     market_params: MarketParams,
     rbm_model,
     rbm_config: Dict[str, Any],
@@ -76,8 +76,8 @@ def simulate_day(
         raise ValueError("default_loss must be [M]")
     if alive.shape != (M,):
         raise ValueError("alive must be [M]")
-    if r_prev.shape != (N,):
-        raise ValueError("r_prev must be [N]")
+    #if r_prev.shape != (N,):
+    #    raise ValueError("r_prev must be [N]")
 
     if device is None:
         device = P.device
@@ -87,21 +87,21 @@ def simulate_day(
     C = C.to(device=device)
     default_loss = default_loss.to(device=device)
     alive = alive.to(device=device, dtype=torch.bool)
-    r_prev = r_prev.to(device=device)
+    # r_prev = r_prev.to(device=device)
 
     d = 0 if day is None else int(day)
 
     if logger is not None:
-        logger.log(day=d, phase="start", P=P, W=W, C=C, alive=alive, z_t=int(z_prev), r_t=r_prev, default_loss=default_loss)
+        logger.log(day=d, phase="start", P=P, W=W, C=C, alive=alive, r_t=r_prev, default_loss=default_loss)
 
-    z_t, r_t, _d_t = generate_day(z_prev, r_prev, market_params, generator=g_market)
+    r_t = generate_day2(market_params.days_df, r_prev, num_cols = num_cols)
     if sim_params.stress_day is not None and d == int(sim_params.stress_day):
         r_t = r_t * float(sim_params.stress_return_scale) + float(sim_params.stress_return_shift)
 
     pnl = (P * r_t[None, :]).sum(dim=1)
 
     if logger is not None:
-        logger.log(day=d, phase="market_move", P=P, W=W, C=C, alive=alive, z_t=int(z_t), r_t=r_t, pnl=pnl, default_loss=default_loss)
+        logger.log(day=d, phase="market_move", P=P, W=W, C=C, alive=alive, r_t=r_t, pnl=pnl, default_loss=default_loss)
 
     W_settle = W + pnl
     F_pre = (W - C) + pnl
@@ -120,7 +120,6 @@ def simulate_day(
             W=W_settle,
             C=C_after_f,
             alive=alive,
-            z_t=int(z_t),
             r_t=r_t,
             default_loss=default_loss,
             default_loss_total=default_loss_total,
@@ -130,7 +129,6 @@ def simulate_day(
         model=rbm_model,
         config=rbm_config,
         quantizer=quantizer,
-        z_t=z_t,
         r_prev_float=r_t,
         num_samples=num_scenarios,
         burn_in=burn_in,
@@ -148,7 +146,6 @@ def simulate_day(
             W=W_settle,
             C=C_after_f,
             alive=alive,
-            z_t=int(z_t),
             r_t=r_t,
             M_req_cur=M_req_cur,
             var_cur=var_cur,
@@ -179,7 +176,6 @@ def simulate_day(
             W=W_new,
             C=C_new,
             alive=alive_new,
-            z_t=int(z_t),
             r_t=r_t,
             M_req_cur=M_req_cur,
             var_cur=var_cur,
@@ -201,7 +197,6 @@ def simulate_day(
             W=W_new,
             C=C_new,
             alive=alive_new,
-            z_t=int(z_t),
             r_t=r_t,
             M_req_cur=M_req_cur,
             M_req_tent=M_req_tent,
@@ -255,7 +250,6 @@ def simulate_day(
             W=W_new,
             C=C_new,
             alive=alive_new,
-            z_t=int(z_t),
             r_t=r_t,
             M_req_cur=M_req_cur,
             M_req_tent=M_req_tent,
@@ -284,7 +278,6 @@ def simulate_day(
     M_req_next = margin_es(P_next, R_scenarios, alpha=sim_params.alpha)
     C_next = C_new
 
-    z_prev_next = int(z_t)
     r_prev_next = r_t
 
     if logger is not None:
@@ -295,7 +288,6 @@ def simulate_day(
             W=W_new,
             C=C_next,
             alive=alive_new,
-            z_t=int(z_t),
             r_t=r_t,
             pnl=pnl,
             M_req_cur=M_req_next,
@@ -310,9 +302,7 @@ def simulate_day(
         "W": W_new,
         "C": C_next,
         "alive": alive_new,
-        "z_prev": z_prev_next,
         "r_prev": r_prev_next,
-        "z_t": int(z_t),
         "r_t": r_t,
         "pnl": pnl,
         "M_req_cur": M_req_cur,

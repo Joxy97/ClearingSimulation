@@ -243,7 +243,7 @@ def main() -> None:
 
         P, W, C, alive = out["P"], out["W"], out["C"], out["alive"]
         default_loss = out.get("default_loss", default_loss)
-        z_prev, r_prev = out["z_prev"], out["r_prev"]
+        r_prev = out["r_prev"]
 
         default_now = out["default_now"]
         x = out["x"]
@@ -268,7 +268,7 @@ def main() -> None:
         acc_rate = float((x[alive].float().mean().item()) if n_alive > 0 else 0.0)
 
         print(
-            f"Day {t + 1:02d}/{args.T:02d} | state z={out['z_t']} | alive={n_alive:02d} | defaulted={n_def:02d} | "
+            f"Day {t + 1:02d}/{args.T:02d} | alive={n_alive:02d} | defaulted={n_def:02d} | "
             f"acc_rate={acc_rate:.2f} | "
             f"mean_pnl={_safe_mean(pnl, alive):.2f} | "
             f"mean_margin={_safe_mean(M_req_cur, alive):.2f} | "
