@@ -13,6 +13,7 @@ if REPO_ROOT not in sys.path:
 
 from boltzmann import RBM  # noqa: E402
 
+from clearing.counterparty import CounterpartyParams, generate_counterparty_network, initialize_default_fund  # noqa: E402
 from clearing.logger import LogConfig, SimLogger  # noqa: E402
 from clearing.margin import margin_es  # noqa: E402
 from clearing.market import make_default_params, simulate_market  # noqa: E402
@@ -57,6 +58,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stress-return-scale", type=float, default=3.0, help="Return scale on the stress day.")
     parser.add_argument("--stress-return-shift", type=float, default=-0.05, help="Return shift on the stress day.")
     parser.add_argument("--log-path", type=str, default="simulations/logs/run_log.pt", help="Output path for log tensor.")
+    parser.add_argument("--counterparty", action="store_true", help="Enable counterparty network.")
+    parser.add_argument("--cp-density", type=float, default=0.15, help="Network density.")
+    parser.add_argument("--cp-network-type", type=str, default="random", choices=["random", "preferential", "hedging"], help="Network topology type.")
+    parser.add_argument("--cp-df-ratio", type=float, default=0.05, help="Default fund ratio.")
+    parser.add_argument("--cp-cva-multiplier", type=float, default=0.10, help="CVA multiplier.")
+    parser.add_argument("--cp-second-order", action="store_true", help="Enable cascading defaults.")
     return parser.parse_args()
 
 
@@ -65,6 +72,20 @@ def _safe_mean(v: torch.Tensor, mask: torch.Tensor | None = None) -> float:
         return float(v.mean().item())
     vv = v[mask]
     return float(vv.mean().item()) if vv.numel() > 0 else 0.0
+
+
+def _load_rbm_from_folder(run_folder: str, device: str):
+    """Load RBM model and config from a run folder."""
+    model_path = os.path.join(run_folder, "model.pt")
+    checkpoint = torch.load(model_path, map_location=device)
+
+    cfg = checkpoint["config"]
+    model = RBM(cfg)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    return model, cfg
 
 
 def _load_or_fit_quantizer(
@@ -115,7 +136,7 @@ def main() -> None:
     g_market = torch.Generator(device=device).manual_seed(args.seed_market)
     g_trade = torch.Generator(device=device).manual_seed(args.seed_trade)
 
-    model, cfg = RBM.from_run_folder(args.model_run, device=device)
+    model, cfg = _load_rbm_from_folder(args.model_run, device=device)
 
     quantizer = _load_or_fit_quantizer(
         quantizer_path=args.quantizer,
@@ -199,6 +220,34 @@ def main() -> None:
     C = M_req_init * (1.0 + init_collateral_buffer)
     F_init = M_req_init * init_liquidity_buffer
     W = C + F_init
+
+    # Initialize counterparty network
+    counterparty_network = None
+    counterparty_params = None
+
+    if args.counterparty:
+        counterparty_params = CounterpartyParams(
+            enabled=True,
+            network_density=args.cp_density,
+            network_type=args.cp_network_type,
+            default_fund_ratio=args.cp_df_ratio,
+            cva_multiplier=args.cp_cva_multiplier,
+            second_order_defaults=args.cp_second_order,
+        )
+
+        counterparty_network = generate_counterparty_network(
+            M=args.M, P=P, params=counterparty_params, generator=g_init
+        )
+
+        # Initialize default fund based on initial margins
+        initialize_default_fund(counterparty_network, M_req_init, counterparty_params)
+
+        # Deduct DF contributions from wealth
+        W = W - counterparty_network.default_fund_contrib
+
+        print(f"Counterparty network: {len(counterparty_network.contracts)} contracts")
+        print(f"Default fund: {counterparty_network.total_default_fund:.2f}")
+
     W_start_total = float(W.sum().item())
 
     logger = SimLogger(
@@ -207,6 +256,7 @@ def main() -> None:
             store_scenario_stats=True,
             scenarios_max_omega=200,
             scenarios_max_assets=min(20, args.N),
+            store_counterparty=True,
         )
     )
 
@@ -229,6 +279,8 @@ def main() -> None:
             quantizer=quantizer,
             trade_params=trade_params,
             sim_params=sim_params,
+            counterparty_network=counterparty_network,
+            counterparty_params=counterparty_params,
             g_market=g_market,
             g_trade=g_trade,
             num_scenarios=args.Omega,
@@ -244,6 +296,7 @@ def main() -> None:
         P, W, C, alive = out["P"], out["W"], out["C"], out["alive"]
         default_loss = out.get("default_loss", default_loss)
         z_prev, r_prev = out["z_prev"], out["r_prev"]
+        counterparty_network = out.get("counterparty_network", counterparty_network)
 
         default_now = out["default_now"]
         x = out["x"]
@@ -337,6 +390,12 @@ def main() -> None:
             "zero_trade_std": float(trade_params.zero_trade_std),
             "alpha": float(sim_params.alpha),
             "post_full_margin_daily": bool(sim_params.post_full_margin_daily),
+            "counterparty_enabled": bool(args.counterparty) if hasattr(args, 'counterparty') else False,
+            "cp_density": args.cp_density if hasattr(args, 'cp_density') and args.counterparty else None,
+            "cp_network_type": args.cp_network_type if hasattr(args, 'cp_network_type') and args.counterparty else None,
+            "cp_df_ratio": args.cp_df_ratio if hasattr(args, 'cp_df_ratio') and args.counterparty else None,
+            "cp_cva_multiplier": args.cp_cva_multiplier if hasattr(args, 'cp_cva_multiplier') and args.counterparty else None,
+            "cp_second_order": bool(args.cp_second_order) if hasattr(args, 'cp_second_order') and args.counterparty else False,
         }
         torch.save({"records": logger.get(), "meta": metadata}, args.log_path)
         print(f"Saved log to {args.log_path}")
